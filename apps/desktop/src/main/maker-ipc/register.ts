@@ -651,7 +651,9 @@ import {
 import { QueuedAttachmentOwnershipRegistry } from './queuedAttachmentOwnership.js';
 import { AGENT_ISLAND_DISPLAY_CONFIG } from '../agent-island/displayConfig.js';
 import {
+  projectAgentIslandInteractionForOrcaWorker,
   shouldClearAgentIslandSessionForOrcaWorker,
+  shouldNotifyAgentIslandForInteraction as shouldNotifyAgentIslandForInteractionByPolicy,
   shouldNotifyAgentIslandForSession as shouldNotifyAgentIslandForSessionByPolicy,
 } from '../agent-island/notificationPolicy.js';
 import { getAgentIslandService } from '../agent-island/service.js';
@@ -3153,12 +3155,20 @@ function handleAgentIslandInteractionAfterBroadcast(
   request: InteractionRequest,
   interactionEpoch: number | null,
 ): void {
-  if (interactionEpoch === null || !shouldNotifyAgentIslandForSession(session.id)) return;
+  if (
+    interactionEpoch === null ||
+    !shouldNotifyAgentIslandForInteraction(session.id, request.kind)
+  ) {
+    return;
+  }
   try {
+    const isOrcaWorkerSession = isKnownOrcaWorkerSession(session.id);
+    const islandRequest = projectAgentIslandInteractionForOrcaWorker(request, isOrcaWorkerSession);
     getAgentIslandService()?.handleInteractionRequest(
       sessionMetaForIsland(session),
-      request,
+      islandRequest,
       interactionEpoch,
+      { allowPermissionActions: !isOrcaWorkerSession },
     );
   } catch (error) {
     log.warn('Agent Island interaction update failed after maker interaction broadcast', {
@@ -3171,7 +3181,12 @@ function handleAgentIslandInteractionAfterBroadcast(
 }
 
 function handleAgentIslandInteractionDismissed(sessionId: string, requestId: string): void {
-  if (!shouldNotifyAgentIslandForSession(sessionId)) return;
+  if (!shouldNotifyAgentIslandForSession(sessionId)) {
+    // Only Worker permission interactions enter Agent Island. Keep the cleanup
+    // owner-scoped so a suppressed interaction cannot dismiss another session.
+    handleAgentIslandInteractionDismissedByRequestId(requestId, sessionId);
+    return;
+  }
   try {
     getAgentIslandService()?.handleInteractionDismissed(sessionId, requestId);
   } catch (error) {
@@ -3183,9 +3198,12 @@ function handleAgentIslandInteractionDismissed(sessionId: string, requestId: str
   }
 }
 
-function handleAgentIslandInteractionDismissedByRequestId(requestId: string): void {
+function handleAgentIslandInteractionDismissedByRequestId(
+  requestId: string,
+  expectedSessionId?: string,
+): void {
   try {
-    getAgentIslandService()?.handleInteractionDismissedByRequestId(requestId);
+    getAgentIslandService()?.handleInteractionDismissedByRequestId(requestId, expectedSessionId);
   } catch (error) {
     log.warn('Agent Island interaction dismiss update failed by request id', {
       requestId,
@@ -3230,6 +3248,17 @@ function shouldNotifyAgentIslandForSession(sessionId: string): boolean {
   return shouldNotifyAgentIslandForSessionByPolicy(
     AGENT_ISLAND_DISPLAY_CONFIG,
     isKnownOrcaWorkerSession(sessionId),
+  );
+}
+
+function shouldNotifyAgentIslandForInteraction(
+  sessionId: string,
+  interactionKind: string,
+): boolean {
+  return shouldNotifyAgentIslandForInteractionByPolicy(
+    AGENT_ISLAND_DISPLAY_CONFIG,
+    isKnownOrcaWorkerSession(sessionId),
+    interactionKind,
   );
 }
 
@@ -3413,7 +3442,7 @@ export function installDesktopInteractionListener(session: {
   ) => void;
 }): void {
   installDesktopInteractionHandler(session, async (req: InteractionRequest) => {
-    const agentIslandInteractionEpoch = shouldNotifyAgentIslandForSession(session.id)
+    const agentIslandInteractionEpoch = shouldNotifyAgentIslandForInteraction(session.id, req.kind)
       ? (getAgentIslandService()?.captureInteractionEpoch(session.id) ?? null)
       : null;
     // F1-a Phase 2: interaction(ask_user / plan_review / permission)是 turn 暂停边界,
@@ -3421,7 +3450,7 @@ export function installDesktopInteractionListener(session: {
     // ask_user_question / plan_review case 里的 mid-turn assistant 抢救(只入队、不阻塞)。
     if (
       agentIslandInteractionEpoch !== null &&
-      shouldNotifyAgentIslandForSession(session.id) &&
+      shouldNotifyAgentIslandForInteraction(session.id, req.kind) &&
       getAgentIslandService()?.isInteractionCurrent(session.id, agentIslandInteractionEpoch) ===
         false
     ) {

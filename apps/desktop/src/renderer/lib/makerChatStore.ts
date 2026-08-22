@@ -8451,6 +8451,7 @@ function subscribeAll(cb: () => void): () => void {
  * `hasError`             — session ended with an error (used to suppress done notification).
  * `hasPendingAskUser`    — session is waiting for user to answer a question.
  * `hasPendingPermission` — session is waiting for user to grant permission.
+ * `pendingPermissionRequestId` — safe identity for exact attention cleanup.
  * `hasPendingPlanReview` — session is waiting for user to review a plan (FP-3).
  * `hasPendingPluginSetup` — session is waiting for local plugin setup.
  */
@@ -8461,6 +8462,7 @@ export interface SessionStatusInfo {
   sideTask?: boolean;
   hasPendingAskUser: boolean;
   hasPendingPermission: boolean;
+  pendingPermissionRequestId: string | null;
   hasPendingPlanReview: boolean;
   hasPendingPluginSetup: boolean;
 }
@@ -8520,6 +8522,7 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
   for (const [id, state] of sessions) {
     const hasPendingAskUser = state.pendingAskUser !== null;
     const hasPendingPermission = state.pendingPermission !== null;
+    const pendingPermissionRequestId = state.pendingPermission?.requestId ?? null;
     const hasPendingPlanReview = state.pendingPlanReview !== null;
     const hasPendingPluginSetup = hasPendingPluginSetupInteraction(
       state.pendingPluginSetup,
@@ -8541,6 +8544,7 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
         hasError: false,
         hasPendingAskUser,
         hasPendingPermission,
+        pendingPermissionRequestId,
         hasPendingPlanReview,
         hasPendingPluginSetup,
       });
@@ -8557,6 +8561,7 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
         hasError: false,
         hasPendingAskUser,
         hasPendingPermission,
+        pendingPermissionRequestId,
         hasPendingPlanReview,
         hasPendingPluginSetup,
       });
@@ -8577,6 +8582,7 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
       sideTask: state.lastStopWasSideTask,
       hasPendingAskUser: state.pendingAskUser !== null,
       hasPendingPermission: state.pendingPermission !== null,
+      pendingPermissionRequestId: state.pendingPermission?.requestId ?? null,
       hasPendingPlanReview: state.pendingPlanReview !== null,
       hasPendingPluginSetup: hasPendingPluginSetupInteraction(
         state.pendingPluginSetup,
@@ -8618,6 +8624,7 @@ function getRunningSnapshot(): ReadonlyMap<string, SessionStatusInfo> {
         prev.sideTask !== info.sideTask ||
         prev.hasPendingAskUser !== info.hasPendingAskUser ||
         prev.hasPendingPermission !== info.hasPendingPermission ||
+        prev.pendingPermissionRequestId !== info.pendingPermissionRequestId ||
         prev.hasPendingPlanReview !== info.hasPendingPlanReview ||
         prev.hasPendingPluginSetup !== info.hasPendingPluginSetup
       ) {

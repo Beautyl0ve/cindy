@@ -192,6 +192,10 @@ describe('permission interaction IPC', () => {
       suggestions,
       autoReviewUnavailable: false,
     });
+    expect(makerChatStore.getRunningSnapshot().get(SESSION_ID)).toMatchObject({
+      hasPendingPermission: true,
+      pendingPermissionRequestId: 'perm-1',
+    });
   });
 
   it('forwards updatedPermissions back through resolveInteraction', () => {
@@ -231,6 +235,9 @@ describe('permission interaction IPC', () => {
       }),
     );
     expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission).toBeNull();
+    expect(
+      makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestId ?? null,
+    ).toBeNull();
   });
 });
 

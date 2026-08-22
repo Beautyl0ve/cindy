@@ -86,7 +86,20 @@ export interface ApplyRuntimeSetModelChangeInput {
    * 是否跨「远端压缩身份」边界;不传时该判定按未知保守处理(倾向关会话重建)。
    */
   codexAuthInjection?: CodexProxyAuthInjection | null;
+  /**
+   * Require an in-place change on the existing local Codex handle. Used by
+   * plan approval, where closing/rebuilding or deferring would destroy the
+   * exact interaction boundary that still needs to be approved.
+   */
+  requireHotSwitch?: boolean;
   logger?: RuntimeSetModelLogger;
+}
+
+export class RuntimeSetModelHotSwitchRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RuntimeSetModelHotSwitchRequiredError';
+  }
 }
 
 export type ApplyRuntimeSetModelChangeResult =
@@ -156,13 +169,34 @@ export async function applyRuntimeSetModelChange(
     return selfBusyMemo;
   };
 
-  if (
+  const providerRouteWouldDefer =
     sess?.agentKind === 'codex' &&
     !sess.remoteHostId &&
     !shouldCloseSession &&
     currentProviderId !== nextProviderId &&
-    isSelfBusy()
-  ) {
+    isSelfBusy();
+
+  if (input.requireHotSwitch) {
+    if (!sess || sess.agentKind !== 'codex' || !!sess.remoteHostId) {
+      throw new RuntimeSetModelHotSwitchRequiredError(
+        'Plan implementation models can only be changed on a live local Codex session',
+      );
+    }
+    if (
+      !currentProviderId ||
+      !nextProviderId ||
+      currentProviderId !== nextProviderId ||
+      pendingTarget !== undefined ||
+      shouldCloseSession ||
+      providerRouteWouldDefer
+    ) {
+      throw new RuntimeSetModelHotSwitchRequiredError(
+        'Plan approval can only hot-switch models on the current provider and credential route',
+      );
+    }
+  }
+
+  if (providerRouteWouldDefer) {
     // 超集 host 可以跨来源复用，不代表 route 可以在 turn 中途热切。Codex 的一个
     // turn 可能包含多次上游请求；立即改 provider store 会让后续工具回合带着旧
     // wire model 命中新来源，造成同 turn 跨计费，甚至因模型不受支持而 4xx。

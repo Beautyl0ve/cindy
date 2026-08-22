@@ -243,6 +243,7 @@ vi.mock('@/state/modelVisibilityPrefs', () => ({
 }));
 
 vi.mock('@/state/providerModelMemory', () => ({
+  MODEL_PRESET_SLOT_ID: '*',
   useProviderModelMemoryVersion: () => 0,
 }));
 
@@ -380,6 +381,35 @@ describe('ModelSelector provider groups', () => {
     expect(within(anthropicGroup).getByText('Sonnet 4.6')).toBeTruthy();
     expect(within(dashscopeGroup).getByText('qwen3.7-plus')).toBeTruthy();
     expect(within(dashscopeGroup).queryByText('Opus 4.8')).toBeNull();
+  });
+
+  it('filters every model row to an explicitly restricted provider route', async () => {
+    renderSelector({ restrictToProviderId: 'anthropic' });
+    await openDropdown();
+
+    const popover = screen.getByTestId('model-options-popover');
+    const groups = within(popover).getAllByRole('group');
+    expect(groups).toHaveLength(1);
+    expect(within(groups[0]).getByText('Anthropic')).toBeTruthy();
+    expect(within(popover).queryByText('阿里云百炼')).toBeNull();
+    expect(within(popover).queryByText('qwen3.7-plus')).toBeNull();
+  });
+
+  it('keeps the unified panel on the restricted provider route', async () => {
+    renderSelector({
+      restrictToProviderId: 'anthropic',
+      unifiedPanel: true,
+      unifiedAgents: ['claude-code'],
+      onUnifiedSelect: vi.fn(),
+      actualRoute: true,
+      agentIdentity: { vendorKey: 'cc', state: 'current' },
+    });
+    await openDropdown();
+
+    const popover = screen.getByTestId('model-options-popover');
+    expect(within(popover).getByText('Opus 4.8')).toBeTruthy();
+    expect(within(popover).queryByText('阿里云百炼')).toBeNull();
+    expect(within(popover).queryByText('qwen3.7-plus')).toBeNull();
   });
 
   it('hides effort summaries when the entry only supports selecting a model id', async () => {

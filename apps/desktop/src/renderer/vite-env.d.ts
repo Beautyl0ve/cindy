@@ -5425,6 +5425,16 @@ interface ElectronAPI {
       expectedAgentSwitchRevision?: number,
       selection?: { effort: string; fastMode: boolean },
     ) => Promise<{ deferred: boolean; superseded?: boolean } | undefined>;
+    /** Local Desktop-only: atomically hot-switch a Codex model and approve the exact plan. */
+    approvePlanReviewWithModel: (input: {
+      sessionId: string;
+      requestId: string;
+      editedPlan: string;
+      model: string;
+      providerId: string;
+      effort: string;
+      fastMode: boolean;
+    }) => Promise<{ deferred: boolean; superseded?: boolean }>;
     /**
      * session-agent-switch:同一会话切换 agent 引擎(claude-code ↔ codex)。
      * 同引擎换模型走 setModel;跨引擎必须走本方法。意图制:本调用只登记切换

@@ -804,7 +804,12 @@ import {
   storeCustomProviderHeaders,
   storeCustomProviderKey,
 } from '../secrets/providerSecretStore.js';
-import { setSessionEffort, setSessionFastMode } from '../maker-host/session-effort-store.js';
+import {
+  getSessionEffort,
+  getSessionFastMode,
+  setSessionEffort,
+  setSessionFastMode,
+} from '../maker-host/session-effort-store.js';
 import {
   getModelVisibilityMirrorSnapshot,
   syncModelVisibilityMirrorForOwner,
@@ -842,8 +847,19 @@ import {
   CredentialModeSwitchBusyError,
   isCredentialModeSwitchBusyError,
   isLocalSessionBusy,
+  shouldCloseSessionForCredentialSwitch,
 } from '../maker-host/codex-credential-switch.js';
-import { applyRuntimeSetModelChange } from './runtimeSetModel.js';
+import {
+  applyRuntimeSetModelChange,
+  RuntimeSetModelHotSwitchRequiredError,
+} from './runtimeSetModel.js';
+import {
+  assessPlanReviewModelContextSwitch,
+  PlanReviewModelApprovalCoordinator,
+  PlanReviewModelApprovalError,
+  resolveConservativePlanReviewContextTokens,
+  runPlanReviewModelApprovalTransaction,
+} from './planReviewModelApproval.js';
 import { applyRuntimeEffortWithRecovery } from './runtimeSetEffort.js';
 import { normalizeDeviceLinkSetModelWireArgs } from './setModelWireArgs.js';
 import { PendingCredentialSwitchService } from './pendingCredentialSwitch.js';
@@ -2067,6 +2083,28 @@ interface PendingInteractionEntry {
 }
 
 const pendingInteractionResolvers = new Map<string, PendingInteractionEntry>();
+const planReviewModelApprovalCoordinator = new PlanReviewModelApprovalCoordinator();
+
+interface PlanReviewModelApprovalRequest {
+  requestId: string;
+  editedPlan: string;
+}
+
+function parsePlanReviewModelApproval(value: unknown): PlanReviewModelApprovalRequest | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throwIpcError('INVALID_PARAMS', 'planApproval must be an object');
+  }
+  const requestId = (value as { requestId?: unknown }).requestId;
+  const editedPlan = (value as { editedPlan?: unknown }).editedPlan;
+  if (typeof requestId !== 'string' || !requestId.trim()) {
+    throwIpcError('INVALID_PARAMS', 'planApproval.requestId required');
+  }
+  if (typeof editedPlan !== 'string' || editedPlan.length > 2_000_000) {
+    throwIpcError('INVALID_PARAMS', 'planApproval.editedPlan must be a bounded string');
+  }
+  return { requestId, editedPlan };
+}
 
 /**
  * submit_github_issue 工具的提交前确认桥(kind='issue_confirm')。独立于
@@ -2344,6 +2382,31 @@ function resolvePendingInteraction(requestId: string, decision: InteractionDecis
     }
   }
   return true;
+}
+
+function resolvePendingInteractionIfCurrent(
+  requestId: string,
+  expected: PendingInteractionEntry,
+  decision: InteractionDecision,
+): boolean {
+  if (pendingInteractionResolvers.get(requestId) !== expected) return false;
+  try {
+    return resolvePendingInteraction(requestId, decision);
+  } catch (error) {
+    // clearPendingInteraction + Promise resolver invocation are the commit
+    // boundary. A later mirror/persistence notification failure must not make
+    // the model transaction roll back after the implementation turn was
+    // already released.
+    if (pendingInteractionResolvers.get(requestId) !== expected) {
+      log.error('plan approval post-commit notification failed', {
+        sessionId: expected.sessionId,
+        requestId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return true;
+    }
+    throw error;
+  }
 }
 
 function resolvePendingPermissionFromAgentIsland(
@@ -13677,6 +13740,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     MAKER_INVOKE.RESOLVE_INTERACTION,
     (event, requestId: unknown, decision: unknown) => {
       if (typeof requestId !== 'string') throwIpcError('INVALID_PARAMS', 'requestId required');
+      if (planReviewModelApprovalCoordinator.isReserved(requestId)) {
+        throwIpcError('PRECONDITION_FAILED', 'plan approval is already applying a model change');
+      }
       if (
         isPluginSetupInteractionDecision(decision) &&
         !parseGhostSetupInteractionCommand(decision)
@@ -13748,12 +13814,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   ipcMain.handle(
     MAKER_INVOKE.SET_MODEL,
     async (
-      _e,
+      event,
       sessionId: unknown,
       model: unknown,
       providerId?: unknown,
       expectedAgentSwitchRevision?: unknown,
       selection?: unknown,
+      planApproval?: unknown,
     ) => {
       if (typeof sessionId !== 'string' || typeof model !== 'string') {
         throwIpcError('INVALID_PARAMS', 'sessionId + model required');
@@ -13795,6 +13862,22 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         throwIpcError('INVALID_PARAMS', 'selection must contain effort + fastMode');
       }
       const atomicSelection = selection as { effort: string; fastMode: boolean } | undefined;
+      const parsedPlanApproval = parsePlanReviewModelApproval(planApproval);
+      if (parsedPlanApproval) {
+        if (isDeviceLinkInvoke()) {
+          throwIpcError(
+            'UNSUPPORTED_CAPABILITY',
+            'plan implementation model selection is local-only',
+          );
+        }
+        assertTrustedAppRendererEvent(event as Parameters<typeof assertTrustedAppRendererEvent>[0]);
+        if (!atomicSelection || providerId === undefined) {
+          throwIpcError(
+            'INVALID_PARAMS',
+            'plan implementation model selection requires provider, effort, and fastMode',
+          );
+        }
+      }
       // 与 send 事务共用 session 锁:发送时刻执行的跨引擎切换必须先落定,
       // 后到的 SET_MODEL 才能写 route。否则切换 DB await 恢复后会用旧 provider
       // 覆盖用户刚选的新 route，形成 DB 与进程内路由分叉。
@@ -13868,38 +13951,60 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             );
           }
         }
-        try {
-          const result = await applySetModelThenCancelAgentSwitchIntent(
-            agentSwitchPending,
+        type PlanModelSnapshot = {
+          db: { model: string; providerId: string | null; effort: string; fastMode: boolean };
+          runtime: { model: string; providerId: string | null; effort: string; fastMode: boolean };
+          contextTokens: number;
+        };
+        const planAtomicSelection = parsedPlanApproval ? atomicSelection : undefined;
+        const applyRuntime = (requireHotSwitch: boolean) =>
+          applyRuntimeSetModelChange({
+            maker,
             sessionId,
-            () =>
-              applyRuntimeSetModelChange({
-                maker,
+            model,
+            providerId: effectiveProviderId,
+            ...(atomicSelection
+              ? {
+                  effort: atomicSelection.effort as
+                    | 'minimal'
+                    | 'low'
+                    | 'medium'
+                    | 'high'
+                    | 'xhigh'
+                    | 'max'
+                    | 'ultra',
+                }
+              : {}),
+            isSessionInTurn,
+            registerPendingCredentialSwitch: registerPendingCredentialSwitchForSession,
+            clearPendingCredentialSwitch: clearPendingCredentialSwitchForSession,
+            wakeSessionInputQueue: wakeSessionInputAfterCredentialSwitch,
+            getPendingCredentialSwitch: getPendingCredentialSwitchTarget,
+            // 解析隐式来源的凭证家族,精确判定是否跨远端压缩身份边界(见
+            // shouldCloseSessionForCredentialSwitch.codexAuthInjection)。
+            codexAuthInjection: getCodexProxyAuthInjectionState(),
+            requireHotSwitch,
+            logger: log,
+          });
+
+        const applyModelSelection = async (
+          requireHotSwitch: boolean,
+        ): Promise<{ deferred: boolean; superseded: boolean }> => {
+          // Plan approval has already rejected any pending agent switch. Avoid
+          // clearing/broadcasting that separate state machine so rollback only
+          // has to restore the model-selection transaction itself.
+          const result = requireHotSwitch
+            ? await applyRuntime(true)
+            : await applySetModelThenCancelAgentSwitchIntent(
+                agentSwitchPending,
                 sessionId,
-                model,
-                providerId: effectiveProviderId,
-                ...(atomicSelection
-                  ? {
-                      effort: atomicSelection.effort as
-                        'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra',
-                    }
-                  : {}),
-                isSessionInTurn,
-                registerPendingCredentialSwitch: registerPendingCredentialSwitchForSession,
-                clearPendingCredentialSwitch: clearPendingCredentialSwitchForSession,
-                wakeSessionInputQueue: wakeSessionInputAfterCredentialSwitch,
-                getPendingCredentialSwitch: getPendingCredentialSwitchTarget,
-                // 解析隐式来源的凭证家族,精确判定是否跨远端压缩身份边界(见
-                // shouldCloseSessionForCredentialSwitch.codexAuthInjection)。
-                codexAuthInjection: getCodexProxyAuthInjectionState(),
-                logger: log,
-              }),
-            (id) =>
-              broadcastSessionPatched(id, {
-                agentSwitchIntent: null,
-                agentSwitchIntentCanceled: true,
-              }),
-          );
+                () => applyRuntime(false),
+                (id) =>
+                  broadcastSessionPatched(id, {
+                    agentSwitchIntent: null,
+                    agentSwitchIntentCanceled: true,
+                  }),
+              );
           // deferred = 会话自己在跑,选择已登记、turn 结束自动生效。renderer 据此提示
           // "任务结束后生效"而不是当成已即时切换。
           const response = { deferred: result.status === 'deferred', superseded: false };
@@ -13918,70 +14023,348 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             ) {
               await sess.setEffort(
                 atomicSelection.effort as
-                  'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra',
+                  | 'minimal'
+                  | 'low'
+                  | 'medium'
+                  | 'high'
+                  | 'xhigh'
+                  | 'max'
+                  | 'ultra',
               );
               if (sess.agentKind === 'codex') {
                 await sess.setFastMode(atomicSelection.fastMode);
               }
             }
           }
-          if (isDeviceLinkInvoke() || atomicSelection) {
-            // device-link 的通用持久化原本发生在 handler 返回、session 锁释放之后；
-            // 本地 renderer 的 sessionService.update 也有同一窗口。凡携带 selection 的
-            // 新调用都由 host 在解锁前一次落定全部字段。
-            const patch: Record<string, unknown> = { model };
-            if (effectiveProviderId !== undefined) {
-              patch.providerId = normalizeSessionProviderId(
-                typeof effectiveProviderId === 'string' ? effectiveProviderId : null,
-              );
-            }
-            if (atomicSelection) {
-              patch.effort = atomicSelection.effort;
-              patch.fastMode = atomicSelection.fastMode;
-            }
-            await persistSessionFields(sessionId, patch);
-            if (isDeviceLinkInvoke()) {
-              // dispatch 继续兼容最小/旧 handler 的锁外回流；标记本结果避免重复写。
-              markRemoteSettingPersistedInsideHandler(response);
-            }
-          }
-          if (!response.deferred) {
-            const currentAgentKind =
-              maker.getSession(sessionId)?.agentKind ??
-              dbToMakerAgentKind(getSessionDbAgentKind(sessionId));
-            const verifiedWindow = lookupVerifiedContextWindow(
-              (agentKind, modelId, pid) =>
-                resolveVerifiedContextWindow(
-                  getActiveCatalog(),
-                  dbToMakerAgentKind(agentKind),
-                  pid,
-                  modelId,
-                ),
-              model,
+          return response;
+        };
+
+        const persistModelSelection = async (
+          response: { deferred: boolean; superseded: boolean },
+        ): Promise<void> => {
+          if (!isDeviceLinkInvoke() && !atomicSelection) return;
+          // device-link 的通用持久化原本发生在 handler 返回、session 锁释放之后；
+          // 本地 renderer 的 sessionService.update 也有同一窗口。凡携带 selection 的
+          // 新调用都由 host 在解锁前一次落定全部字段。
+          const patch: Record<string, unknown> = { model };
+          if (effectiveProviderId !== undefined) {
+            patch.providerId = normalizeSessionProviderId(
               typeof effectiveProviderId === 'string' ? effectiveProviderId : null,
-              currentAgentKind,
             );
-            if (verifiedWindow) {
-              const [usage] = await getDbClient()
-                .drizzle.select({ contextTokens: sessions.contextTokens })
-                .from(sessions)
-                .where(eq(sessions.id, sessionId))
-                .limit(1);
-              await recordSessionContextSnapshot(
-                sessionId,
-                usage?.contextTokens ?? 0,
-                verifiedWindow,
+          }
+          if (atomicSelection) {
+            patch.effort = atomicSelection.effort;
+            patch.fastMode = atomicSelection.fastMode;
+          }
+          await persistSessionFields(sessionId, patch);
+          if (isDeviceLinkInvoke()) {
+            // dispatch 继续兼容最小/旧 handler 的锁外回流；标记本结果避免重复写。
+            markRemoteSettingPersistedInsideHandler(response);
+          }
+        };
+
+        const recordAppliedModelContextSnapshot = async (): Promise<void> => {
+          const currentAgentKind =
+            maker.getSession(sessionId)?.agentKind ??
+            dbToMakerAgentKind(getSessionDbAgentKind(sessionId));
+          const verifiedWindow = lookupVerifiedContextWindow(
+            (agentKind, modelId, pid) =>
+              resolveVerifiedContextWindow(
+                getActiveCatalog(),
+                dbToMakerAgentKind(agentKind),
+                pid,
+                modelId,
+              ),
+            model,
+            typeof effectiveProviderId === 'string' ? effectiveProviderId : null,
+            currentAgentKind,
+          );
+          if (!verifiedWindow) return;
+          const [usage] = await getDbClient()
+            .drizzle.select({ contextTokens: sessions.contextTokens })
+            .from(sessions)
+            .where(eq(sessions.id, sessionId))
+            .limit(1);
+          await recordSessionContextSnapshot(
+            sessionId,
+            usage?.contextTokens ?? 0,
+            verifiedWindow,
+          );
+        };
+
+        const rollbackPlanModelSelection = async (
+          planSnapshot: PlanModelSnapshot,
+        ): Promise<void> => {
+          const failures: unknown[] = [];
+          try {
+            await applyRuntimeSetModelChange({
+              maker,
+              sessionId,
+              model: planSnapshot.runtime.model,
+              providerId: planSnapshot.runtime.providerId,
+              effort: planSnapshot.runtime.effort as
+                'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra',
+              isSessionInTurn,
+              codexAuthInjection: getCodexProxyAuthInjectionState(),
+              requireHotSwitch: true,
+              logger: log,
+            });
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
+            setSessionEffort(sessionId, planSnapshot.runtime.effort);
+            setSessionFastMode(sessionId, planSnapshot.runtime.fastMode);
+            const rollbackSession = maker.getSession(sessionId);
+            if (!rollbackSession || rollbackSession.agentKind !== 'codex') {
+              throw new Error('live Codex session disappeared during model rollback');
+            }
+            await rollbackSession.setEffort(
+              planSnapshot.runtime.effort as
+                'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra',
+            );
+            await rollbackSession.setFastMode(planSnapshot.runtime.fastMode);
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
+            await persistSessionFields(sessionId, planSnapshot.db);
+          } catch (error) {
+            failures.push(error);
+          }
+          if (failures.length > 0) {
+            throw new AggregateError(failures, 'plan implementation model rollback failed');
+          }
+        };
+
+        try {
+          if (parsedPlanApproval) {
+            if (!planAtomicSelection) {
+              throwIpcError('INVALID_PARAMS', 'plan implementation selection is missing');
+            }
+            const expectedPending = pendingInteractionResolvers.get(
+              parsedPlanApproval.requestId,
+            );
+            const liveSession = maker.getSession(sessionId);
+            if (
+              !expectedPending ||
+              expectedPending.sessionId !== sessionId ||
+              expectedPending.kind !== 'plan_review' ||
+              expectedPending.request.requestId !== parsedPlanApproval.requestId
+            ) {
+              throwIpcError(
+                'PRECONDITION_FAILED',
+                'the selected plan review is no longer pending',
               );
             }
+            if (!liveSession || liveSession.agentKind !== 'codex' || !!liveSession.remoteHostId) {
+              throwIpcError(
+                'UNSUPPORTED_CAPABILITY',
+                'implementation model selection requires a live local Codex session',
+              );
+            }
+            if (
+              agentSwitchPending.get(sessionId) ||
+              pendingCredentialSwitchHolder?.has(sessionId)
+            ) {
+              throwIpcError(
+                'PRECONDITION_FAILED',
+                'finish the pending model or agent switch before approving this plan',
+              );
+            }
+            const targetProviderId = normalizeSessionProviderId(effectiveProviderId);
+            if (
+              !currentProviderId ||
+              !targetProviderId ||
+              currentProviderId !== targetProviderId ||
+              shouldCloseSessionForCredentialSwitch({
+                agentKind: liveSession.agentKind,
+                remoteHostId: liveSession.remoteHostId,
+                currentProviderId,
+                nextProviderId: targetProviderId,
+                currentModel: liveSession.model,
+                nextModel: model,
+                currentCodexProxyActive: liveSession.codexProxyActive,
+                currentCodexThreadModelProviderId:
+                  liveSession.codexThreadModelProviderId,
+                codexAuthInjection: getCodexProxyAuthInjectionState(),
+              })
+            ) {
+              throw new RuntimeSetModelHotSwitchRequiredError(
+                'Plan approval can only hot-switch models on the current provider and credential route',
+              );
+            }
+            const response = await runPlanReviewModelApprovalTransaction({
+              coordinator: planReviewModelApprovalCoordinator,
+              requestId: parsedPlanApproval.requestId,
+              expectedPending,
+              readPending: () => pendingInteractionResolvers.get(parsedPlanApproval.requestId),
+              captureSnapshot: async () => {
+                const [row] = await getDbClient()
+                  .drizzle.select({
+                    model: sessions.model,
+                    providerId: sessions.providerId,
+                    effort: sessions.effort,
+                    fastMode: sessions.fastMode,
+                    contextTokens: sessions.contextTokens,
+                  })
+                  .from(sessions)
+                  .where(eq(sessions.id, sessionId))
+                  .limit(1);
+                const currentLive = maker.getSession(sessionId);
+                if (!row || !currentLive || currentLive !== liveSession) {
+                  throw new PlanReviewModelApprovalError(
+                    'stale',
+                    'the Codex session changed before its model could be updated',
+                  );
+                }
+                if (!hasSessionProvider(sessionId)) {
+                  hydrateSessionProvider(sessionId, row.providerId?.trim() || null);
+                }
+                const liveUsage = currentLive.getUsageSnapshot?.();
+                return {
+                  db: {
+                    model: row.model,
+                    providerId: row.providerId?.trim() || null,
+                    effort: row.effort,
+                    fastMode: row.fastMode,
+                  },
+                  runtime: {
+                    model: currentLive.model,
+                    providerId: getSessionProvider(sessionId),
+                    effort: getSessionEffort(sessionId) ?? row.effort,
+                    fastMode: getSessionFastMode(sessionId),
+                  },
+                  // A plan review can be emitted before the turn-end DB usage
+                  // flush. Never let that stale row understate the live handle.
+                  contextTokens: resolveConservativePlanReviewContextTokens(
+                    row.contextTokens,
+                    liveUsage?.contextTokens,
+                  ),
+                };
+              },
+              revalidate: (snapshot) => {
+                const currentLive = maker.getSession(sessionId);
+                const runtimeProviderId = getSessionProvider(sessionId);
+                if (
+                  !currentLive ||
+                  currentLive !== liveSession ||
+                  runtimeProviderId !== snapshot.runtime.providerId ||
+                  runtimeProviderId !== targetProviderId ||
+                  shouldCloseSessionForCredentialSwitch({
+                    agentKind: currentLive.agentKind,
+                    remoteHostId: currentLive.remoteHostId,
+                    currentProviderId: runtimeProviderId,
+                    nextProviderId: targetProviderId,
+                    currentModel: currentLive.model,
+                    nextModel: model,
+                    currentCodexProxyActive: currentLive.codexProxyActive,
+                    currentCodexThreadModelProviderId:
+                      currentLive.codexThreadModelProviderId,
+                    codexAuthInjection: getCodexProxyAuthInjectionState(),
+                  })
+                ) {
+                  throw new RuntimeSetModelHotSwitchRequiredError(
+                    'The live provider or credential route changed before plan approval',
+                  );
+                }
+                if (snapshot.runtime.model !== model) {
+                  const targetContextWindow = lookupVerifiedContextWindow(
+                    (agentKind, modelId, pid) =>
+                      resolveVerifiedContextWindow(
+                        getActiveCatalog(),
+                        dbToMakerAgentKind(agentKind),
+                        pid,
+                        modelId,
+                      ),
+                    model,
+                    targetProviderId,
+                    currentLive.agentKind,
+                  );
+                  const contextAssessment = assessPlanReviewModelContextSwitch({
+                    currentModel: snapshot.runtime.model,
+                    targetModel: model,
+                    contextTokens: snapshot.contextTokens,
+                    targetContextWindow: targetContextWindow ?? undefined,
+                    autoCompactThresholdPct: readCompactionPct(),
+                  });
+                  if (contextAssessment.requiresHandoff) {
+                    throw new RuntimeSetModelHotSwitchRequiredError(
+                      `Plan approval cannot hot-switch into a ${contextAssessment.level} context (${contextAssessment.projectedPct}% of the target window)`,
+                    );
+                  }
+                }
+              },
+              isUnchanged: (snapshot) =>
+                snapshot.runtime.model === model &&
+                snapshot.runtime.providerId === targetProviderId &&
+                snapshot.runtime.effort === planAtomicSelection.effort &&
+                snapshot.runtime.fastMode === planAtomicSelection.fastMode &&
+                snapshot.db.model === model &&
+                snapshot.db.providerId === targetProviderId &&
+                snapshot.db.effort === planAtomicSelection.effort &&
+                snapshot.db.fastMode === planAtomicSelection.fastMode,
+              unchangedValue: { deferred: false, superseded: false },
+              apply: () => applyModelSelection(true),
+              persist: (_snapshot, response) => persistModelSelection(response),
+              rollback: rollbackPlanModelSelection,
+              resolve: (expected) =>
+                resolvePendingInteractionIfCurrent(parsedPlanApproval.requestId, expected, {
+                  kind: 'plan_review',
+                  behavior: 'allow',
+                  editedPlan: parsedPlanApproval.editedPlan,
+                }),
+            });
+            // Deliberately post-commit: a stale/replaced approval must roll back
+            // only the model transaction and cannot strand a new context-window
+            // snapshot while the plan remains pending.
+            try {
+              await recordAppliedModelContextSnapshot();
+            } catch (error) {
+              // The exact resolver has already released the implementation
+              // turn. Derived display state must not make renderer retry a
+              // successfully committed approval.
+              log.warn('plan approval context snapshot refresh failed (non-fatal)', {
+                sessionId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            return response;
+          }
+
+          const response = await applyModelSelection(false);
+          await persistModelSelection(response);
+          if (!response.deferred) {
+            await recordAppliedModelContextSnapshot();
           }
           return response;
         } catch (err) {
-          if (err instanceof CredentialModeSwitchBusyError) {
+          const error = err;
+          if (
+            error instanceof RuntimeSetModelHotSwitchRequiredError ||
+            (error instanceof PlanReviewModelApprovalError && error.failure !== 'rollback_failed')
+          ) {
+            throwIpcError('PRECONDITION_FAILED', error.message);
+          }
+          if (
+            error instanceof PlanReviewModelApprovalError &&
+            error.failure === 'rollback_failed'
+          ) {
+            log.error('plan implementation model rollback failed', {
+              sessionId,
+              requestId: parsedPlanApproval?.requestId,
+            });
+            throwIpcError(
+              'INTERNAL',
+              'The model change could not be safely rolled back; the plan was not approved',
+            );
+          }
+          if (error instanceof CredentialModeSwitchBusyError) {
             // 兜底(正常路径 busy 已转 deferred):切模型撞上凭证切换忙,独立 code,
             // renderer toast 走 ipcError.CREDENTIAL_SWITCH_BUSY 专属文案。
-            throwIpcError('CREDENTIAL_SWITCH_BUSY', err.message);
+            throwIpcError('CREDENTIAL_SWITCH_BUSY', error.message);
           }
-          throw err;
+          throw error;
         }
       });
     },

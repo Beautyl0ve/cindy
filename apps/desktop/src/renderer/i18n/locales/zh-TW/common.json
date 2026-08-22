@@ -6734,6 +6734,7 @@
       "saveFailed": "儲存失敗：{{message}}",
       "outlineLabel": "目錄",
       "outlineEmpty": "(無章節)",
+      "implementationModel": "執行計劃的模型",
       "approve": "批准計劃並開始編碼",
       "feedbackPlaceholder": "告訴 Agent 應該怎麼做",
       "cancel": "取消本次計劃",

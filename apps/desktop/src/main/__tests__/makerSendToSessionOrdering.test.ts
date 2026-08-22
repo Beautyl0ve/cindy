@@ -492,7 +492,9 @@ describe('sendToSession ordering', () => {
     expect(setModelBlock).toContain('setSessionFastMode(sessionId, atomicSelection.fastMode);');
     expect(setModelBlock).toContain('await sess.setEffort(');
     expect(setModelBlock).toContain('await sess.setFastMode(atomicSelection.fastMode);');
-    expect(setModelBlock).toContain('if (isDeviceLinkInvoke() || atomicSelection) {');
+    expect(setModelBlock).toContain(
+      'if (!isDeviceLinkInvoke() && !atomicSelection) return;',
+    );
     expect(setModelBlock).toContain('patch.effort = atomicSelection.effort;');
     expect(setModelBlock).toContain('patch.fastMode = atomicSelection.fastMode;');
     expect(setModelBlock).toContain('await persistSessionFields(sessionId, patch);');
@@ -514,8 +516,51 @@ describe('sendToSession ordering', () => {
     );
     expectOrder(
       setModelBlock,
-      'await persistSessionFields(sessionId, patch);',
+      'const response = await applyModelSelection(false);',
+      'await persistModelSelection(response);',
+    );
+    expectOrder(setModelBlock, 'await persistModelSelection(response);', 'if (!response.deferred)');
+    expect(setModelBlock).toContain(
+      'const recordAppliedModelContextSnapshot = async (): Promise<void> =>',
+    );
+    expect(setModelBlock).toContain('const response = await runPlanReviewModelApprovalTransaction({');
+    expect(setModelBlock).toContain('contextTokens: sessions.contextTokens');
+    expect(setModelBlock).toContain('const liveUsage = currentLive.getUsageSnapshot?.();');
+    expect(setModelBlock).toContain('contextTokens: resolveConservativePlanReviewContextTokens(');
+    expect(setModelBlock).toContain('if (snapshot.runtime.model !== model) {');
+    expect(setModelBlock).toContain('const targetContextWindow = lookupVerifiedContextWindow(');
+    expect(setModelBlock).toContain('const contextAssessment = assessPlanReviewModelContextSwitch({');
+    expect(setModelBlock).toContain('autoCompactThresholdPct: readCompactionPct()');
+    expect(setModelBlock).toContain('if (contextAssessment.requiresHandoff) {');
+    expectOrder(
+      setModelBlock,
+      'const contextAssessment = assessPlanReviewModelContextSwitch({',
+      'apply: () => applyModelSelection(true)',
+    );
+    expectOrder(
+      setModelBlock,
+      'const response = await runPlanReviewModelApprovalTransaction({',
+      "log.warn('plan approval context snapshot refresh failed (non-fatal)'",
+    );
+    const planApprovalTail = extractBetween(
+      setModelBlock,
+      'const response = await runPlanReviewModelApprovalTransaction({',
       'return response;',
+    );
+    expectOrder(
+      planApprovalTail,
+      'resolve: (expected) =>',
+      'await recordAppliedModelContextSnapshot();',
+    );
+    const ordinarySetModelTail = extractBetween(
+      setModelBlock,
+      'const response = await applyModelSelection(false);',
+      'return response;',
+    );
+    expectOrder(
+      ordinarySetModelTail,
+      'await persistModelSelection(response);',
+      'await recordAppliedModelContextSnapshot();',
     );
     expect(preloadSource).toContain('selection?: { effort: string; fastMode: boolean },');
     expectOrder(

@@ -5892,6 +5892,29 @@ contextBridge.exposeInMainWorld('electronAPI', {
         expectedAgentSwitchRevision,
         selection,
       ),
+    /**
+     * Local Desktop-only Codex plan boundary. Main reuses maker:set-model under
+     * the session lock, but also reserves/revalidates the exact plan request
+     * before resolving it. It is intentionally absent from device-link routing.
+     */
+    approvePlanReviewWithModel: (input: {
+      sessionId: string;
+      requestId: string;
+      editedPlan: string;
+      model: string;
+      providerId: string;
+      effort: string;
+      fastMode: boolean;
+    }): Promise<{ deferred: boolean; superseded?: boolean }> =>
+      ipcRenderer.invoke(
+        'maker:set-model',
+        input.sessionId,
+        input.model,
+        input.providerId,
+        undefined,
+        { effort: input.effort, fastMode: input.fastMode },
+        { requestId: input.requestId, editedPlan: input.editedPlan },
+      ),
     // session-agent-switch:同一会话切换 agent 引擎(claude-code ↔ codex)。
     // 与 setModel 的边界:同引擎换模型走 setModel,跨引擎必须走本方法。
     // 意图制:本调用只登记切换意图(deferred=true 为常态返回),真正的交接与

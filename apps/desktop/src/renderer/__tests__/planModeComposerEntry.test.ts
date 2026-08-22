@@ -11,7 +11,7 @@
  *     (编辑反馈时批准行 ⏎ 隐藏,反馈 ⏎ 仅在有文字时出现且可点击发送)
  */
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
@@ -30,6 +30,40 @@ vi.mock('@/components/ui/confirm-dialog-provider', () => ({
 vi.mock('@/components/chat/MarkdownRenderer', () => ({
   MarkdownRenderer: () => null,
 }));
+
+vi.mock('@/components/new-chat/ModelSelector', async () => {
+  const { createElement } = await import('react');
+  return {
+    ModelSelector: (props: {
+      modelId: string;
+      disabled?: boolean;
+      restrictToProviderId?: string;
+    }) =>
+      createElement(
+        'div',
+        null,
+        createElement(
+          'button',
+          {
+            type: 'button',
+            disabled: props.disabled,
+            'data-testid': 'plan-model-selector',
+            'data-provider-scope': props.restrictToProviderId,
+          },
+          props.modelId,
+        ),
+        createElement('div', {
+          role: 'option',
+          tabIndex: 0,
+          'aria-selected': false,
+          'data-testid': 'plan-model-option',
+          onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => {
+            if (event.key === 'Enter') event.preventDefault();
+          },
+        }),
+      ),
+  };
+});
 
 import { ExtraDirsButton } from '@/components/new-chat/ExtraDirsButton';
 import { AtMentionPanel } from '@/components/new-chat/AtMentionPanel';
@@ -414,5 +448,87 @@ describe('PlanActionCard 取消(Esc)与 ⏎ 去重', () => {
 
     expect(onRespond).not.toHaveBeenCalled();
     expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('异步批准在途时双击只提交一次,失败后重新解锁', async () => {
+    let finish!: (accepted: boolean) => void;
+    const onRespond = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    render(createElement(PlanActionCard, { requestId: 'pr-async', onRespond }));
+
+    const approve = screen.getByText('newChat.planReview.approve').closest('button')!;
+    fireEvent.click(approve);
+    fireEvent.click(approve);
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(approve.disabled).toBe(true);
+
+    finish(false);
+    await waitFor(() => expect(approve.disabled).toBe(false));
+    fireEvent.click(approve);
+    expect(onRespond).toHaveBeenCalledTimes(2);
+  });
+
+  it('仅显式传入时显示实现模型选择器,反馈仍只走原响应通道', () => {
+    const onRespond = vi.fn();
+    const onUnifiedSelect = vi.fn();
+    render(
+      createElement(PlanActionCard, {
+        requestId: 'pr-model',
+        onRespond,
+        implementationModel: {
+          modelId: 'gpt-5.5',
+          providerId: 'openai',
+          effort: 'high',
+          fastMode: false,
+          onModelChange: vi.fn(),
+          onProviderChange: vi.fn(),
+          onEffortChange: vi.fn(),
+          onFastModeChange: vi.fn(),
+          onUnifiedSelect,
+        },
+      }),
+    );
+    const selector = screen.getByTestId('plan-model-selector');
+    expect(selector.textContent).toContain('gpt-5.5');
+    expect(selector.getAttribute('data-provider-scope')).toBe('openai');
+    fireEvent.click(screen.getByText('newChat.planReview.feedbackPlaceholder'));
+    const textarea = screen.getByPlaceholderText('newChat.planReview.feedbackPlaceholder');
+    fireEvent.change(textarea, { target: { value: 'keep planning' } });
+    fireEvent.click(screen.getByLabelText('newChat.planReview.submitFeedbackAria'));
+    expect(onRespond).toHaveBeenCalledWith('pr-model', false, 'keep planning');
+    expect(onUnifiedSelect).not.toHaveBeenCalled();
+  });
+
+  it('模型行拥有 Enter / Escape,不会连带批准或取消计划', () => {
+    const onRespond = vi.fn();
+    const onCancel = vi.fn();
+    render(
+      createElement(PlanActionCard, {
+        requestId: 'pr-model-keyboard',
+        onRespond,
+        onCancel,
+        implementationModel: {
+          modelId: 'gpt-5.5',
+          providerId: 'openai',
+          effort: 'high',
+          fastMode: false,
+          onModelChange: vi.fn(),
+          onProviderChange: vi.fn(),
+          onEffortChange: vi.fn(),
+          onFastModeChange: vi.fn(),
+          onUnifiedSelect: vi.fn(),
+        },
+      }),
+    );
+
+    fireEvent.keyDown(screen.getByTestId('plan-model-option'), { key: 'Enter' });
+    fireEvent.keyDown(screen.getByTestId('plan-model-option'), { key: 'Escape' });
+
+    expect(onRespond).not.toHaveBeenCalled();
+    expect(onCancel).not.toHaveBeenCalled();
   });
 });

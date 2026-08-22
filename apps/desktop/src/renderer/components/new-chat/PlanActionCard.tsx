@@ -26,7 +26,9 @@ import { useTranslation } from 'react-i18next';
 import { CornerDownLeft, Pencil } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
+import type { Effort } from '@/lib/userPreferences.types';
 import { ListComposerTextarea } from './ListComposerTextarea';
+import { ModelSelector } from './ModelSelector';
 
 // ---------------------------------------------------------------------------
 // Props
@@ -34,46 +36,104 @@ import { ListComposerTextarea } from './ListComposerTextarea';
 
 interface PlanActionCardProps {
   requestId: string;
-  onRespond: (requestId: string, approved: boolean, feedback?: string) => void;
+  onRespond: (
+    requestId: string,
+    approved: boolean,
+    feedback?: string,
+  ) => void | boolean | Promise<void | boolean>;
   /**
    * 取消本次审阅(Esc 快捷键;可见入口在 PlanViewerCard 工具条的 X):
    * 关闭卡片并结束本轮计划循环 —— 不批准、不发修订 turn,下一条消息回到常规模式。
    */
   onCancel?: (requestId: string) => void;
+  implementationModel?: {
+    modelId: string;
+    providerId: string;
+    effort: Effort;
+    fastMode: boolean;
+    onModelChange: (modelId: string) => void;
+    onProviderChange: (providerId: string | null, modelId?: string, effort?: Effort) => void;
+    onEffortChange: (effort: Effort) => void;
+    onFastModeChange: (enabled: boolean) => void;
+    onUnifiedSelect: (selection: {
+      providerId: string;
+      modelId: string;
+      effort?: Effort;
+      engine: 'cc' | 'codex' | 'pi';
+      fast: boolean;
+      favoriteUid: string | null;
+    }) => void;
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
-export function PlanActionCard({ requestId, onRespond, onCancel }: PlanActionCardProps) {
+export function PlanActionCard({
+  requestId,
+  onRespond,
+  onCancel,
+  implementationModel,
+}: PlanActionCardProps) {
   const { t } = useTranslation();
   const [feedback, setFeedback] = useState('');
   const [isEditing, setIsEditing] = useState(false);
   // Important #3: once the user triggers Approve or Feedback, freeze the card
   // so rapid double-clicks can't fire two IPC responses for the same requestId.
   const [submitted, setSubmitted] = useState(false);
+  const submittedRef = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
+  useEffect(() => {
+    submittedRef.current = false;
+    setSubmitted(false);
+    setFeedback('');
+    setIsEditing(false);
+  }, [requestId]);
+
+  const beginSubmission = useCallback(
+    (submit: () => void | boolean | Promise<void | boolean>) => {
+      if (submittedRef.current) return;
+      submittedRef.current = true;
+      setSubmitted(true);
+      let result: void | boolean | Promise<void | boolean>;
+      try {
+        result = submit();
+      } catch {
+        submittedRef.current = false;
+        setSubmitted(false);
+        return;
+      }
+      void Promise.resolve(result)
+        .then((accepted) => {
+          if (accepted !== false) return;
+          submittedRef.current = false;
+          setSubmitted(false);
+        })
+        .catch(() => {
+          submittedRef.current = false;
+          setSubmitted(false);
+        });
+    },
+    [],
+  );
+
   const handleApprove = useCallback(() => {
-    if (submitted) return;
-    setSubmitted(true);
-    onRespond(requestId, true);
-  }, [requestId, onRespond, submitted]);
+    beginSubmission(() => onRespond(requestId, true));
+  }, [beginSubmission, requestId, onRespond]);
 
   const handleSubmitFeedback = useCallback(() => {
-    if (submitted) return;
+    if (submittedRef.current) return;
     const trimmed = feedback.trim();
     if (!trimmed) return;
-    setSubmitted(true);
-    onRespond(requestId, false, trimmed);
-  }, [feedback, requestId, onRespond, submitted]);
+    beginSubmission(() => onRespond(requestId, false, trimmed));
+  }, [beginSubmission, feedback, requestId, onRespond]);
 
   const handleCancel = useCallback(() => {
-    if (submitted || !onCancel) return;
-    setSubmitted(true);
-    onCancel(requestId);
-  }, [requestId, onCancel, submitted]);
+    if (!onCancel) return;
+    beginSubmission(() => onCancel(requestId));
+  }, [beginSubmission, requestId, onCancel]);
 
   /**
    * Minor #8: auto-grow the textarea as the user types so long feedback isn't
@@ -106,17 +166,25 @@ export function PlanActionCard({ requestId, onRespond, onCancel }: PlanActionCar
   // Mirrors the AskUserQuestionPrompt global-keyboard pattern.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (isEditing || submitted) return;
+      // Nested controls such as ModelSelector's keyboard-focusable model rows
+      // consume Enter with preventDefault(). Respect that ownership so choosing
+      // a model cannot also approve the plan with the previous selection.
+      if (e.defaultPrevented || isEditing || submitted) return;
       // Avoid hijacking keys when any other input / textarea / button /
       // contenteditable on the page has focus — e.g. the search bar, toolbar
       // buttons, settings forms, etc.
-      const target = e.target as HTMLElement | null;
+      const target = e.target instanceof HTMLElement ? e.target : null;
       const tag = target?.tagName;
       if (
         tag === 'INPUT' ||
         tag === 'TEXTAREA' ||
         tag === 'BUTTON' ||
-        (target && (target as HTMLElement).isContentEditable)
+        tag === 'SELECT' ||
+        tag === 'A' ||
+        target?.isContentEditable ||
+        target?.closest(
+          '[role="option"], [role="listbox"], [role="slider"], [role="dialog"], [role="menu"], [role="menuitem"], [role="button"]',
+        )
       ) {
         return;
       }
@@ -142,6 +210,35 @@ export function PlanActionCard({ requestId, onRespond, onCancel }: PlanActionCar
         'border-[var(--plan-card-border)] bg-[var(--plan-card-bg)]',
       )}
     >
+      {implementationModel && (
+        <div className="flex items-center justify-between gap-3 border-b border-[var(--plan-action-row-divider)] px-[16px] py-[10px]">
+          <span className="min-w-0 text-12 text-[var(--plan-action-fb-placeholder)]">
+            {t('newChat.planReview.implementationModel')}
+          </span>
+          <ModelSelector
+            modelId={implementationModel.modelId}
+            effort={implementationModel.effort}
+            fastMode={implementationModel.fastMode}
+            currentProviderId={implementationModel.providerId}
+            restrictToProviderId={implementationModel.providerId}
+            onModelChange={implementationModel.onModelChange}
+            onProviderChange={implementationModel.onProviderChange}
+            onEffortChange={implementationModel.onEffortChange}
+            onFastModeChange={implementationModel.onFastModeChange}
+            onUnifiedSelect={implementationModel.onUnifiedSelect}
+            vendorKey="codex"
+            agentIdentity={{ vendorKey: 'codex', state: 'current' }}
+            unifiedPanel
+            unifiedAgents={['codex']}
+            actualRoute
+            dense
+            compactToolbar
+            popoverSide="top"
+            maxVisibleModelRows={6}
+            disabled={submitted}
+          />
+        </div>
+      )}
       {/* Approve Row */}
       <button
         type="button"

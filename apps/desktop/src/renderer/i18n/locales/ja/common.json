@@ -6734,6 +6734,7 @@
       "saveFailed": "保存に失敗しました:{{message}}",
       "outlineLabel": "目次",
       "outlineEmpty": "(セクションなし)",
+      "implementationModel": "実装に使用するモデル",
       "approve": "計画を承認してコーディングを開始",
       "feedbackPlaceholder": "Agent にどうすべきかを伝える",
       "cancel": "今回の計画をキャンセル",

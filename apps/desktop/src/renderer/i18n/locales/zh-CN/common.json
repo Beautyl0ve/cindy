@@ -6734,6 +6734,7 @@
       "saveFailed": "保存失败：{{message}}",
       "outlineLabel": "目录",
       "outlineEmpty": "(无章节)",
+      "implementationModel": "执行计划的模型",
       "approve": "批准计划并开始编码",
       "feedbackPlaceholder": "告诉 Agent 应该怎么做",
       "cancel": "取消本次计划",

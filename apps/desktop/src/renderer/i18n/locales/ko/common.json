@@ -6734,6 +6734,7 @@
       "saveFailed": "저장 실패: {{message}}",
       "outlineLabel": "목차",
       "outlineEmpty": "(섹션 없음)",
+      "implementationModel": "구현에 사용할 모델",
       "approve": "계획을 승인하고 코딩 시작",
       "feedbackPlaceholder": "Agent에게 어떻게 해야 할지 알려주세요",
       "cancel": "이번 계획 취소",

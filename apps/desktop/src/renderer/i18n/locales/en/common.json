@@ -6736,6 +6736,7 @@
       "saveFailed": "Save failed: {{message}}",
       "outlineLabel": "Content",
       "outlineEmpty": "(No sections)",
+      "implementationModel": "Implementation model",
       "approve": "Approve the plan and start coding",
       "feedbackPlaceholder": "Tell the agent what to do instead",
       "cancel": "Dismiss this plan",

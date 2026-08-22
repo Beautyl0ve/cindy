@@ -600,6 +600,11 @@ interface ModelSelectorProps {
    */
   currentProviderId?: string | null;
   /**
+   * Fail-closed source scope for flows that may choose a model but must not
+   * change the live provider route (for example, atomic plan approval).
+   */
+  restrictToProviderId?: string;
+  /**
    * 返回值(若有)= **这次选择真的应用了没有**(`false` / 抛错 = 没应用;返回 void 的调用方
    * 视为应用了)。统一面板的会话路径靠它决定要不要记收藏锚点 —— 取消上下文容量确认、
    * 远程写穿失败、settingsLocked 都会走到 `false` 那一支(2026-08-17 review 第五轮 M4);
@@ -798,6 +803,8 @@ interface ModelSelectorContentProps {
   /** 模型信息 / 选项浮层的额外样式。供嵌套在高层级 overlay 中的调用方覆盖默认 z-index。 */
   overlayContentClassName?: string;
   currentProviderId?: string | null;
+  /** 语义同 ModelSelectorProps.restrictToProviderId。 */
+  restrictToProviderId?: string;
   /** 语义同 ModelSelectorProps.onProviderChange(含返回值口径)。 */
   onProviderChange?: (
     providerId: string | null,
@@ -1040,6 +1047,7 @@ function ModelSelectorContentView({
   maxVisibleModelRows,
   overlayContentClassName,
   currentProviderId,
+  restrictToProviderId,
   onProviderChange,
   onNavigateToProviders,
   followSession,
@@ -1145,7 +1153,14 @@ function ModelSelectorContentView({
   // (useDeviceProviders,隧道 maker:provider:list)。两 hook 都无条件调用(hooks 规则),按 deviceId 取。
   const localProviders = useProviders();
   const remoteProviders = useDeviceProviders(deviceId);
-  const providers = deviceId ? remoteProviders.providers : localProviders.providers;
+  const providerCatalog = deviceId ? remoteProviders.providers : localProviders.providers;
+  const providers = useMemo(
+    () =>
+      restrictToProviderId
+        ? providerCatalog.filter((provider) => provider.id === restrictToProviderId)
+        : providerCatalog,
+    [providerCatalog, restrictToProviderId],
+  );
   const providersLoading = deviceId ? remoteProviders.loading : localProviders.loading;
   const remoteModelListStatus = resolveRemoteModelListStatus({
     deviceId,
@@ -3118,6 +3133,7 @@ export function ModelSelector({
   unknownModelLabel,
   ariaContext,
   currentProviderId,
+  restrictToProviderId,
   sourceDisconnected = false,
   actualRoute = false,
   onProviderChange,
@@ -3260,7 +3276,14 @@ export function ModelSelector({
   // 查不到被控端独有模型 → currentModel undefined → label 退成 "Select model")。
   const localProviders = useProviders();
   const remoteProviders = useDeviceProviders(deviceId);
-  const providers = deviceId ? remoteProviders.providers : localProviders.providers;
+  const providerCatalog = deviceId ? remoteProviders.providers : localProviders.providers;
+  const providers = useMemo(
+    () =>
+      restrictToProviderId
+        ? providerCatalog.filter((provider) => provider.id === restrictToProviderId)
+        : providerCatalog,
+    [providerCatalog, restrictToProviderId],
+  );
   const remoteModelListStatus = resolveRemoteModelListStatus({
     deviceId,
     agentKind,
@@ -3820,6 +3843,7 @@ export function ModelSelector({
       actualRoute={actualRoute}
       maxVisibleModelRows={maxVisibleModelRows}
       currentProviderId={currentProviderId}
+      restrictToProviderId={restrictToProviderId}
       onProviderChange={onProviderChange}
       onNavigateToProviders={onNavigateToProviders}
       configurationEnabled={configurationEnabled}

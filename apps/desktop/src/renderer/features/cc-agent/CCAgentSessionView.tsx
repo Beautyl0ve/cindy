@@ -248,6 +248,10 @@ import {
 } from './deferredUiAssignment';
 import { shouldFallbackVendorModel } from './lib/vendorModelFallback';
 import { localizeAgentStatus } from './lib/localizeAgentStatus';
+import {
+  canChoosePlanImplementationModel,
+  planImplementationApprovalPath,
+} from './planImplementationModelEligibility';
 import { createSessionRefreshSequence } from './lib/sessionRefreshSequence';
 import { createSessionSnapshotPatchBuffer } from './lib/sessionSnapshotPatchBuffer';
 import { readPanelCollapsedRecord } from '@/layout/collapsePrefs';
@@ -1600,6 +1604,157 @@ export function CCAgentSessionView({
       toast.error(t('newChat.collaboration.assignmentFailed'));
     });
   }, [historyLoaded, isOrcaLeadSessionView, messages, remoteConn, remoteDeviceId, sessionId, t]);
+  // 展示引擎可乐观跟随 intent；真实 event reducer 仍只读 store.agentKind。
+  const displayAgentKind = agentSwitchIntent?.target ?? dbToMakerAgentKind(session?.agentKind);
+  // 真实会话 agentKind(pending switch intent 不影响)——压缩分流与计划审批切模都必须用它。
+  const realAgentKind = dbToMakerAgentKind(session?.agentKind);
+  const isCodex = displayAgentKind === 'codex';
+  const planImplementationModelAvailable = canChoosePlanImplementationModel({
+    hasPendingPlanReview: !!pendingPlanReview && !!session,
+    agentKind: realAgentKind,
+    providerId: session?.providerId,
+    remoteHostId: session?.remoteHostId,
+    deviceLinkDeviceId: rightSidebarDeviceLinkDeviceId,
+    hasAgentSwitchIntent: !!agentSwitchIntent,
+    settingsLocked: session?.source === 'review',
+  });
+  type PlanImplementationSelection = {
+    requestId: string;
+    modelId: string;
+    providerId: string;
+    effort: Effort;
+    fastMode: boolean;
+  };
+  const [planImplementationOverride, setPlanImplementationOverride] =
+    useState<PlanImplementationSelection | null>(null);
+  const defaultPlanImplementationSelection = useMemo<PlanImplementationSelection | null>(() => {
+    if (!planImplementationModelAvailable || !pendingPlanReview || !session) return null;
+    const providerId = session.providerId?.trim();
+    if (!providerId) return null;
+    return {
+      requestId: pendingPlanReview.requestId,
+      modelId: session.model,
+      providerId,
+      effort: session.effort as Effort,
+      fastMode,
+    };
+  }, [fastMode, pendingPlanReview, planImplementationModelAvailable, session]);
+  const planImplementationSelection =
+    planImplementationOverride?.requestId === pendingPlanReview?.requestId
+      ? planImplementationOverride
+      : defaultPlanImplementationSelection;
+  const offeredPlanImplementationRequestRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (planImplementationModelAvailable && pendingPlanReview) {
+      offeredPlanImplementationRequestRef.current = pendingPlanReview.requestId;
+    }
+  }, [pendingPlanReview, planImplementationModelAvailable]);
+
+  const handlePlanReviewResponse = useCallback(
+    async (requestId: string, approved: boolean, feedback?: string): Promise<boolean> => {
+      if (!approved) {
+        respondToPlanReview(requestId, false, feedback);
+        return true;
+      }
+      const selected = planImplementationSelection;
+      const approvalPath = planImplementationApprovalPath({
+        requestId,
+        offeredRequestId: offeredPlanImplementationRequestRef.current,
+        featureAvailable: planImplementationModelAvailable && !!sessionId,
+        pendingRequestId: pendingPlanReview?.requestId ?? null,
+        selectionRequestId: selected?.requestId ?? null,
+      });
+      if (approvalPath === 'ordinary') {
+        respondToPlanReview(requestId, true);
+        return true;
+      }
+      if (approvalPath === 'stale' || !sessionId || !pendingPlanReview || !selected) {
+        toast.error(t('newChat.chatInput.switchFailed'));
+        return false;
+      }
+      try {
+        const result = await window.electronAPI.maker.approvePlanReviewWithModel({
+          sessionId,
+          requestId,
+          editedPlan: pendingPlanReview.plan,
+          model: selected.modelId,
+          providerId: selected.providerId,
+          effort: selected.effort,
+          fastMode: selected.fastMode,
+        });
+        if (result.deferred || result.superseded) {
+          throw new Error('plan implementation model was not applied immediately');
+        }
+        return true;
+      } catch (error) {
+        log.warn('plan implementation model approval failed', {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        toast.error(t('newChat.chatInput.switchFailed'));
+        return false;
+      }
+    },
+    [
+      pendingPlanReview,
+      planImplementationSelection,
+      planImplementationModelAvailable,
+      respondToPlanReview,
+      sessionId,
+      t,
+    ],
+  );
+  const planApprovalHandlerRef = useRef(handlePlanReviewResponse);
+  planApprovalHandlerRef.current = handlePlanReviewResponse;
+
+  const planImplementationModel = useMemo(() => {
+    const selected = planImplementationSelection;
+    if (!selected) return undefined;
+    const update = (patch: Partial<Omit<PlanImplementationSelection, 'requestId'>>) => {
+      setPlanImplementationOverride((current) => ({
+        ...(current?.requestId === selected.requestId ? current : selected),
+        ...patch,
+      }));
+    };
+    return {
+      modelId: selected.modelId,
+      providerId: selected.providerId,
+      effort: selected.effort,
+      fastMode: selected.fastMode,
+      onModelChange: (modelId: string) => update({ modelId }),
+      onProviderChange: (providerId: string | null, modelId?: string, effort?: Effort) => {
+        if (!providerId || providerId !== selected.providerId) return;
+        update({
+          providerId,
+          ...(modelId ? { modelId } : {}),
+          ...(effort ? { effort } : {}),
+        });
+      },
+      onEffortChange: (effort: Effort) => update({ effort }),
+      onFastModeChange: (enabled: boolean) => update({ fastMode: enabled }),
+      onUnifiedSelect: (selection: {
+        providerId: string;
+        modelId: string;
+        effort?: Effort;
+        engine: 'cc' | 'codex' | 'pi';
+        fast: boolean;
+      }) => {
+        if (
+          selection.engine !== 'codex' ||
+          selection.providerId !== selected.providerId
+        ) {
+          return;
+        }
+        update({
+          providerId: selection.providerId,
+          modelId: selection.modelId,
+          effort: selection.effort ?? selected.effort,
+          fastMode: selection.fast,
+        });
+      },
+    };
+  }, [planImplementationSelection]);
+
   useEffect(() => {
     return subscribeWorkLouderCodexAction((action) => {
       if (action.type !== 'command') return false;
@@ -1610,7 +1765,7 @@ export function CCAgentSessionView({
           return true;
         }
         if (pendingPlanReview) {
-          respondToPlanReview(pendingPlanReview.requestId, true);
+          void planApprovalHandlerRef.current(pendingPlanReview.requestId, true);
           return true;
         }
         return false;
@@ -1660,17 +1815,10 @@ export function CCAgentSessionView({
     pendingPermission,
     pendingPlanReview,
     respondToPermission,
-    respondToPlanReview,
     sessionId,
     t,
     togglePin,
   ]);
-  // 展示引擎可乐观跟随 intent；真实 event reducer 仍只读 store.agentKind。
-  const displayAgentKind = agentSwitchIntent?.target ?? dbToMakerAgentKind(session?.agentKind);
-  // 真实会话 agentKind(pending switch intent 不影响)——压缩分流必须用它,
-  // 否则 intent 乐观切到 pi 但真实会话仍在跑 claude-code 时会错调 compact-session(#1933 review)。
-  const realAgentKind = dbToMakerAgentKind(session?.agentKind);
-  const isCodex = displayAgentKind === 'codex';
   // 手动压缩通道判定(#1927/#1933 review):真实 Claude Code → maker:input:compact;
   // 其余 agent 声明 manualCompact.supported(当前仅 pi)→ maker:compact-session;其余无入口。
   // 能力取**真实 agent**(displayAgentKind 在 pending switch 期间可能乐观指向目标 agent,
@@ -4585,8 +4733,9 @@ export function CCAgentSessionView({
                     />
                     <PlanActionCard
                       requestId={pendingPlanReview.requestId}
-                      onRespond={respondToPlanReview}
+                      onRespond={handlePlanReviewResponse}
                       onCancel={cancelPlanReview}
+                      implementationModel={planImplementationModel}
                     />
                   </>
                 ) : pendingPermission ? (

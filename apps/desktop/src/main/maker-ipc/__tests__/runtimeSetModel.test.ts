@@ -5,7 +5,11 @@ import {
   getSessionProvider,
   setSessionProvider,
 } from '../../maker-host/session-provider-store.js';
-import { applyRuntimeSetModelChange, type RuntimeSetModelMaker } from '../runtimeSetModel.js';
+import {
+  applyRuntimeSetModelChange,
+  RuntimeSetModelHotSwitchRequiredError,
+  type RuntimeSetModelMaker,
+} from '../runtimeSetModel.js';
 
 const sessionProviderWriteObserver = vi.hoisted(() => ({
   current: null as ((sessionId: string, providerId: string | null) => void) | null,
@@ -40,6 +44,143 @@ function rememberSession(sessionId: string): string {
 }
 
 describe('applyRuntimeSetModelChange', () => {
+  it('rejects a restart-required plan switch before any route or session mutation', async () => {
+    const sessionId = rememberSession('runtime-set-model-plan-no-restart');
+    setSessionProvider(sessionId, 'openai');
+    const setModel = vi.fn(async () => {});
+    const closeSession = vi.fn(async () => {});
+    const registerPendingCredentialSwitch = vi.fn();
+    const maker: RuntimeSetModelMaker = {
+      getSession: () => ({
+        agentKind: 'codex',
+        remoteHostId: null,
+        model: 'gpt-5.4',
+        setModel,
+      }),
+      listActiveSessions: () => [],
+      closeSession,
+    };
+
+    await expect(
+      applyRuntimeSetModelChange({
+        maker,
+        sessionId,
+        model: 'codex/gpt-5.5',
+        providerId: 'xd',
+        requireHotSwitch: true,
+        registerPendingCredentialSwitch,
+      }),
+    ).rejects.toBeInstanceOf(RuntimeSetModelHotSwitchRequiredError);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(registerPendingCredentialSwitch).not.toHaveBeenCalled();
+    expect(setModel).not.toHaveBeenCalled();
+    expect(getSessionProvider(sessionId)).toBe('openai');
+  });
+
+  it('rejects a busy provider-route defer before registering it for plan approval', async () => {
+    const sessionId = rememberSession('runtime-set-model-plan-no-defer');
+    setSessionProvider(sessionId, 'openai');
+    const setModel = vi.fn(async () => {});
+    const registerPendingCredentialSwitch = vi.fn();
+    const maker: RuntimeSetModelMaker = {
+      getSession: () => ({
+        agentKind: 'codex',
+        remoteHostId: null,
+        codexProxyActive: true,
+        model: 'gpt-5.4',
+        setModel,
+      }),
+      listActiveSessions: () => [
+        {
+          id: sessionId,
+          agentKind: 'codex',
+          remoteHostId: null,
+          isTurnRunning: () => true,
+        },
+      ],
+      closeSession: vi.fn(async () => {}),
+    };
+
+    await expect(
+      applyRuntimeSetModelChange({
+        maker,
+        sessionId,
+        model: 'gpt-5.5',
+        providerId: 'xd',
+        requireHotSwitch: true,
+        registerPendingCredentialSwitch,
+      }),
+    ).rejects.toBeInstanceOf(RuntimeSetModelHotSwitchRequiredError);
+
+    expect(registerPendingCredentialSwitch).not.toHaveBeenCalled();
+    expect(setModel).not.toHaveBeenCalled();
+    expect(getSessionProvider(sessionId)).toBe('openai');
+  });
+
+  it('rejects an otherwise reusable cross-provider route before plan approval mutates it', async () => {
+    const sessionId = rememberSession('runtime-set-model-plan-same-route-only');
+    setSessionProvider(sessionId, 'openai');
+    const setModel = vi.fn(async () => {});
+    const closeSession = vi.fn(async () => {});
+    const maker: RuntimeSetModelMaker = {
+      getSession: () => ({
+        agentKind: 'codex',
+        remoteHostId: null,
+        codexProxyActive: true,
+        model: 'gpt-5.4',
+        setModel,
+      }),
+      listActiveSessions: () => [],
+      closeSession,
+    };
+
+    await expect(
+      applyRuntimeSetModelChange({
+        maker,
+        sessionId,
+        model: 'codex/gpt-5.5',
+        providerId: 'xd',
+        requireHotSwitch: true,
+      }),
+    ).rejects.toBeInstanceOf(RuntimeSetModelHotSwitchRequiredError);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(setModel).not.toHaveBeenCalled();
+    expect(getSessionProvider(sessionId)).toBe('openai');
+  });
+
+  it('allows an in-place local Codex model change in plan approval mode', async () => {
+    const sessionId = rememberSession('runtime-set-model-plan-hot');
+    setSessionProvider(sessionId, 'openai');
+    const setModel = vi.fn(async () => {});
+    const maker: RuntimeSetModelMaker = {
+      getSession: () => ({
+        agentKind: 'codex',
+        remoteHostId: null,
+        model: 'gpt-5.4',
+        setModel,
+      }),
+      listActiveSessions: () => [],
+      closeSession: vi.fn(async () => {}),
+    };
+
+    await expect(
+      applyRuntimeSetModelChange({
+        maker,
+        sessionId,
+        model: 'gpt-5.5',
+        providerId: 'openai',
+        effort: 'high',
+        requireHotSwitch: true,
+      }),
+    ).resolves.toEqual({ status: 'applied' });
+    expect(setModel).toHaveBeenCalledWith('gpt-5.5', {
+      providerId: 'openai',
+      effort: 'high',
+    });
+  });
+
   it('rolls back provider route when live setModel rejects', async () => {
     const sessionId = rememberSession('runtime-set-model-rollback');
     setSessionProvider(sessionId, 'xd');

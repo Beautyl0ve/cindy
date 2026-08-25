@@ -215,20 +215,20 @@ describe('permission interaction IPC', () => {
       makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestIds,
     ).toEqual(['perm-a', 'perm-b']);
 
-    listeners.dismissed?.({ sessionId: SESSION_ID, requestId: 'perm-a', reason: 'resolved' });
-    expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission?.requestId).toBe('perm-b');
+    listeners.dismissed?.({ sessionId: SESSION_ID, requestId: 'perm-b', reason: 'resolved' });
+    expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission?.requestId).toBe('perm-a');
     expect(
       makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestIds,
-    ).toEqual(['perm-b']);
+    ).toEqual(['perm-a']);
 
-    listeners.dismissed?.({ sessionId: SESSION_ID, requestId: 'perm-b', reason: 'resolved' });
+    listeners.dismissed?.({ sessionId: SESSION_ID, requestId: 'perm-a', reason: 'resolved' });
     expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission).toBeNull();
     expect(
       makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestIds ?? [],
     ).toEqual([]);
   });
 
-  it('forwards updatedPermissions back through resolveInteraction', () => {
+  it('forwards updatedPermissions and clears only after main accepts the decision', async () => {
     const permissionUpdates = [
       {
         type: 'addRules',
@@ -250,7 +250,7 @@ describe('permission interaction IPC', () => {
       },
     });
 
-    makerChatStore.respondToPermission(SESSION_ID, {
+    const response = makerChatStore.respondToPermission(SESSION_ID, {
       behavior: 'allow',
       updatedPermissions: permissionUpdates,
       decisionClassification: 'user_permanent',
@@ -264,10 +264,36 @@ describe('permission interaction IPC', () => {
         permissionUpdates,
       }),
     );
+    expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission?.requestId).toBe('perm-2');
+    await expect(response).resolves.toBe(true);
     expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission).toBeNull();
     expect(
       makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestId ?? null,
     ).toBeNull();
+  });
+
+  it('keeps the permission card and attention available when main rejects the decision', async () => {
+    resolveInteraction.mockRejectedValueOnce(new Error('device link disconnected'));
+    makerChatStore.initGlobalListeners();
+    listeners.interaction?.({
+      sessionId: SESSION_ID,
+      request: {
+        kind: 'permission',
+        requestId: 'perm-retry',
+        toolName: 'Bash',
+        input: { command: 'pnpm test' },
+      },
+    });
+
+    await expect(
+      makerChatStore.respondToPermission(SESSION_ID, { behavior: 'allow' }),
+    ).resolves.toBe(false);
+    expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission?.requestId).toBe(
+      'perm-retry',
+    );
+    expect(
+      makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestIds,
+    ).toEqual(['perm-retry']);
   });
 });
 

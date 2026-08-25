@@ -459,7 +459,7 @@ describe('sendToSession ordering', () => {
   it('serializes SET_MODEL behind the send-time agent switch for the same session', () => {
     const setModelBlock = extractBetween(
       source,
-      'ipcMain.handle(\n    MAKER_INVOKE.SET_MODEL',
+      'const handleSetModel = async (',
       'ipcMain.handle(MAKER_INVOKE.SET_EFFORT',
     );
     const directSendSwitchBlock = extractBetween(
@@ -469,7 +469,7 @@ describe('sendToSession ordering', () => {
     );
 
     expect(setModelBlock).toContain(
-      'return withSendToSessionLock(sessionId, async () => {',
+      'return withSendToSessionLock(sessionId, applyLocked);',
     );
     expect(setModelBlock).toContain(
       'agentSwitchPending.revision?.(sessionId) !== expectedAgentSwitchRevision',
@@ -477,23 +477,24 @@ describe('sendToSession ordering', () => {
     expect(setModelBlock).toContain('return { deferred: false, superseded: true };');
     expectOrder(
       setModelBlock,
-      'return withSendToSessionLock(sessionId, async () => {',
+      'const applyLocked = async () => {',
       'agentSwitchPending.revision?.(sessionId) !== expectedAgentSwitchRevision',
     );
     expectOrder(
       setModelBlock,
       'agentSwitchPending.revision?.(sessionId) !== expectedAgentSwitchRevision',
-      'applySetModelThenCancelAgentSwitchIntent(',
+      'applyRuntimeSetModelChange({',
     );
     expect(setModelBlock).toContain('if (isDeviceLinkInvoke()) {');
     expect(setModelBlock).toContain('if (atomicSelection) {');
     expect(setModelBlock).toContain('effort: atomicSelection.effort as');
-    expect(setModelBlock).toContain('setSessionEffort(sessionId, atomicSelection.effort);');
-    expect(setModelBlock).toContain('setSessionFastMode(sessionId, atomicSelection.fastMode);');
-    expect(setModelBlock).toContain('await sess.setEffort(');
-    expect(setModelBlock).toContain('await sess.setFastMode(atomicSelection.fastMode);');
-    expect(setModelBlock).toContain(
-      'if (!isDeviceLinkInvoke() && !atomicSelection) return;',
+    expect(setModelBlock).toContain('setSessionEffort(sessionId, selectionToCommit.effort);');
+    expect(setModelBlock).toContain('setSessionFastMode(sessionId, selectionToCommit.fastMode);');
+    expect(setModelBlock).toContain('applyRuntimeSelectionAxesWithRecovery({');
+    expect(setModelBlock).toContain('restoreControlStores,');
+    expect(setModelBlock).toContain('withRehydrateCloseSuppressed(sessionId');
+    expect(setModelBlock).toMatch(
+      /internalOptions\.source === 'user'\s*&&\s*\(isDeviceLinkInvoke\(\) \|\| atomicSelection\)/,
     );
     expect(setModelBlock).toContain('patch.effort = atomicSelection.effort;');
     expect(setModelBlock).toContain('patch.fastMode = atomicSelection.fastMode;');
@@ -501,66 +502,40 @@ describe('sendToSession ordering', () => {
     expect(setModelBlock).toContain('markRemoteSettingPersistedInsideHandler(response);');
     expectOrder(
       setModelBlock,
-      'applySetModelThenCancelAgentSwitchIntent(',
-      'setSessionEffort(sessionId, atomicSelection.effort);',
+      'applyRuntimeSetModelChange({',
+      'const commitControlStores',
     );
     expectOrder(
       setModelBlock,
-      'effort: atomicSelection.effort as',
-      'setSessionEffort(sessionId, atomicSelection.effort);',
+      'applyRuntimeSelectionAxesWithRecovery({',
+      'await persistSessionFields',
     );
     expectOrder(
       setModelBlock,
-      'setSessionFastMode(sessionId, atomicSelection.fastMode);',
+      'setSessionFastMode(sessionId, selectionToCommit.fastMode);',
       'await persistSessionFields(sessionId, patch);',
     );
+    expect(setModelBlock.lastIndexOf('agentSwitchPending.clear(sessionId);')).toBeGreaterThan(
+      setModelBlock.indexOf('await persistSessionFields(sessionId, patch);'),
+    );
     expectOrder(
       setModelBlock,
-      'const response = await applyModelSelection(false);',
-      'await persistModelSelection(response);',
+      'agentSwitchPending.clear(sessionId);',
+      '...response,',
     );
-    expectOrder(setModelBlock, 'await persistModelSelection(response);', 'if (!response.deferred)');
+    expect(setModelBlock).toContain('pendingCredentialSwitchHolder?.clear(sessionId);');
+    expect(setModelBlock).toContain('restoreControlStores();');
+    expect(setModelBlock).toContain('previousRuntime.pendingCredentialSwitch');
+    expect(setModelBlock).toContain('withRehydrateCloseSuppressed(sessionId');
+    expect(setModelBlock).toContain('recordRecoveredSessionRuntimeMutation(sessionId');
     expect(setModelBlock).toContain(
-      'const recordAppliedModelContextSnapshot = async (): Promise<void> =>',
+      'sessionRuntimeControlOwnerEpochMatches(runtimeOwnerEpoch)',
     );
-    expect(setModelBlock).toContain('const response = await runPlanReviewModelApprovalTransaction({');
-    expect(setModelBlock).toContain('contextTokens: sessions.contextTokens');
-    expect(setModelBlock).toContain('const liveUsage = currentLive.getUsageSnapshot?.();');
-    expect(setModelBlock).toContain('contextTokens: resolveConservativePlanReviewContextTokens(');
-    expect(setModelBlock).toContain('if (snapshot.runtime.model !== model) {');
-    expect(setModelBlock).toContain('const targetContextWindow = lookupVerifiedContextWindow(');
-    expect(setModelBlock).toContain('const contextAssessment = assessPlanReviewModelContextSwitch({');
-    expect(setModelBlock).toContain('autoCompactThresholdPct: readCompactionPct()');
-    expect(setModelBlock).toContain('if (contextAssessment.requiresHandoff) {');
+    expect(setModelBlock).toContain('recovered runtime projection broadcast failed');
     expectOrder(
       setModelBlock,
-      'const contextAssessment = assessPlanReviewModelContextSwitch({',
-      'apply: () => applyModelSelection(true)',
-    );
-    expectOrder(
-      setModelBlock,
-      'const response = await runPlanReviewModelApprovalTransaction({',
-      "log.warn('plan approval context snapshot refresh failed (non-fatal)'",
-    );
-    const planApprovalTail = extractBetween(
-      setModelBlock,
-      'const response = await runPlanReviewModelApprovalTransaction({',
-      'return response;',
-    );
-    expectOrder(
-      planApprovalTail,
-      'resolve: (expected) =>',
-      'await recordAppliedModelContextSnapshot();',
-    );
-    const ordinarySetModelTail = extractBetween(
-      setModelBlock,
-      'const response = await applyModelSelection(false);',
-      'return response;',
-    );
-    expectOrder(
-      ordinarySetModelTail,
-      'await persistModelSelection(response);',
-      'await recordAppliedModelContextSnapshot();',
+      'restoreControlStores();',
+      'throw persistenceError;',
     );
     expect(preloadSource).toContain('selection?: { effort: string; fastMode: boolean },');
     expectOrder(
@@ -582,7 +557,7 @@ describe('sendToSession ordering', () => {
   it('仅 Device Link 归一化 SET_MODEL 的 JSON null 可选占位,本地仍走严格校验', () => {
     const setModelBlock = extractBetween(
       source,
-      'ipcMain.handle(\n    MAKER_INVOKE.SET_MODEL',
+      'const handleSetModel = async (',
       'ipcMain.handle(MAKER_INVOKE.SET_EFFORT',
     );
     expect(setModelBlock).toContain('normalizeDeviceLinkSetModelWireArgs(');
@@ -801,7 +776,7 @@ describe('sendToSession ordering', () => {
   it('marks worker idle and clears auto-bridge state before aborting worker sessions', () => {
     const serviceIdleBlock = extractBetween(
       orcaTeamServiceSource,
-      "async function idleWorker(params: { callerLeadSessionId: string; workerId: string; expectedStatus?: 'done' }): Promise<OrcaOkResult> {",
+      'async function idleWorker(',
       'async function archiveWorker',
     );
     const serviceDepsBlock = extractBetween(

@@ -198,6 +198,36 @@ describe('permission interaction IPC', () => {
     });
   });
 
+  it('tracks concurrent permission identities until each exact request is dismissed', () => {
+    makerChatStore.initGlobalListeners();
+    for (const [requestId, toolName] of [
+      ['perm-a', 'Bash'],
+      ['perm-b', 'Read'],
+    ] as const) {
+      listeners.interaction?.({
+        sessionId: SESSION_ID,
+        request: { kind: 'permission', requestId, toolName, input: {} },
+      });
+    }
+
+    expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission?.requestId).toBe('perm-b');
+    expect(
+      makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestIds,
+    ).toEqual(['perm-a', 'perm-b']);
+
+    listeners.dismissed?.({ sessionId: SESSION_ID, requestId: 'perm-a', reason: 'resolved' });
+    expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission?.requestId).toBe('perm-b');
+    expect(
+      makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestIds,
+    ).toEqual(['perm-b']);
+
+    listeners.dismissed?.({ sessionId: SESSION_ID, requestId: 'perm-b', reason: 'resolved' });
+    expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission).toBeNull();
+    expect(
+      makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestIds ?? [],
+    ).toEqual([]);
+  });
+
   it('forwards updatedPermissions back through resolveInteraction', () => {
     const permissionUpdates = [
       {

@@ -21,12 +21,12 @@ function worker(
     leadSessionId: LEAD_ID,
     status,
     focused,
-    pendingPermissionRequestId: null,
+    pendingPermissionRequestIds: [],
   };
 }
 
 function observed(status: OrcaWorkerStatus): WorkerAttentionObservedState {
-  return { status, pendingPermissionRequestId: null };
+  return { status, pendingPermissionRequestIds: [] };
 }
 
 const doneMutation = (workerId: string) => ({ workerId, reason: { kind: 'done' as const } });

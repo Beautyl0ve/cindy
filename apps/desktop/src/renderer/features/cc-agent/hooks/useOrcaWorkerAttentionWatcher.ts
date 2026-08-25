@@ -21,12 +21,12 @@ export interface WorkerAttentionRecord {
   leadSessionId: string;
   status: OrcaWorkerStatus;
   focused: boolean;
-  pendingPermissionRequestId: string | null;
+  pendingPermissionRequestIds: readonly string[];
 }
 
 export interface WorkerAttentionObservedState {
   status: OrcaWorkerStatus;
-  pendingPermissionRequestId: string | null;
+  pendingPermissionRequestIds: readonly string[];
 }
 
 export interface WorkerAttentionMutation {
@@ -56,7 +56,7 @@ export function computeWorkerAttentionUpdates(
     currentWorkerIds.add(worker.workerId);
     nextStateByWorkerId.set(worker.workerId, {
       status: worker.status,
-      pendingPermissionRequestId: worker.pendingPermissionRequestId,
+      pendingPermissionRequestIds: worker.pendingPermissionRequestIds,
     });
 
     const prevState = prevStateByWorkerId.get(worker.workerId);
@@ -68,16 +68,18 @@ export function computeWorkerAttentionUpdates(
       toMark.push({ workerId: worker.workerId, reason: { kind: 'done' } });
     }
 
-    const previousRequestId = prevState?.pendingPermissionRequestId ?? null;
-    const currentRequestId = worker.pendingPermissionRequestId;
-    if (previousRequestId !== currentRequestId) {
-      if (previousRequestId) {
+    const previousRequestIds = new Set(prevState?.pendingPermissionRequestIds ?? []);
+    const currentRequestIds = new Set(worker.pendingPermissionRequestIds);
+    for (const previousRequestId of previousRequestIds) {
+      if (!currentRequestIds.has(previousRequestId)) {
         toClear.push({
           workerId: worker.workerId,
           reason: { kind: 'permission', requestId: previousRequestId },
         });
       }
-      if (currentRequestId) {
+    }
+    for (const currentRequestId of currentRequestIds) {
+      if (!previousRequestIds.has(currentRequestId)) {
         // Permission is live blocking state rather than unread state. Keep it
         // projected even while focused; the selected Worker hides its own dot,
         // and navigating away restores the signal until this request resolves.
@@ -128,8 +130,8 @@ export function useOrcaWorkerAttentionByLeadIds(
           leadSessionId,
           status: worker.status,
           focused: worker.focused,
-          pendingPermissionRequestId:
-            sessionStatusSnapshot.get(worker.sessionId)?.pendingPermissionRequestId ?? null,
+          pendingPermissionRequestIds:
+            sessionStatusSnapshot.get(worker.sessionId)?.pendingPermissionRequestIds ?? [],
         })),
       );
     const updates = computeWorkerAttentionUpdates(

@@ -56,6 +56,7 @@ function status(isRunning: boolean, hasError = false, sideTask?: boolean): Sessi
     hasPendingAskUser: false,
     hasPendingPermission: false,
     pendingPermissionRequestId: null,
+    pendingPermissionRequestIds: [],
     hasPendingPlanReview: false,
     hasPendingPluginSetup: false,
   };

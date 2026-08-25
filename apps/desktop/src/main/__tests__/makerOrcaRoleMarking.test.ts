@@ -35,6 +35,10 @@ describe('maker Orca role marking IPC boundary', () => {
     expect(registerSource).toContain(
       'handleAgentIslandInteractionDismissedByRequestId(requestId, sessionId)',
     );
+    expect(registerSource).toContain(
+      'getAgentIslandService()?.hasPendingPermissionRequestForSession(sessionId) === false',
+    );
+    expect(registerSource).toContain('clearSuppressedOrcaWorkerAgentIslandSession(sessionId);');
   });
 
   it('clears any existing Agent Island entry when a session is marked as an Orca worker', () => {

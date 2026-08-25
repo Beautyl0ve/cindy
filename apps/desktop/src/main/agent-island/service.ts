@@ -1066,6 +1066,13 @@ export class AgentIslandService {
     return true;
   }
 
+  hasPendingPermissionRequestForSession(sessionId: string): boolean {
+    for (const entry of this.permissionRequests.values()) {
+      if (entry.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
   private restorePendingPermissionRequest(sessionId: string, now: number): void {
     let pending: {
       request: Extract<InteractionRequest, { kind: 'permission' }>;

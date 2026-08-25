@@ -89,6 +89,7 @@ const state = (overrides: Partial<SessionChatState> = {}): SessionChatState => (
   historyLoaded: true,
   sdkSessionId: null,
   pendingPermission: null,
+  pendingPermissionRequestIds: [],
   pendingAskUser: null,
   askUserViewerState: 'expanded',
   askUserDraft: null,

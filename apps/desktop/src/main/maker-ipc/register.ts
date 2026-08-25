@@ -3342,7 +3342,13 @@ function handleAgentIslandInteractionDismissed(sessionId: string, requestId: str
   if (!shouldNotifyAgentIslandForSession(sessionId)) {
     // Only Worker permission interactions enter Agent Island. Keep the cleanup
     // owner-scoped so a suppressed interaction cannot dismiss another session.
-    handleAgentIslandInteractionDismissedByRequestId(requestId, sessionId);
+    const dismissed = handleAgentIslandInteractionDismissedByRequestId(requestId, sessionId);
+    if (
+      dismissed &&
+      getAgentIslandService()?.hasPendingPermissionRequestForSession(sessionId) === false
+    ) {
+      clearSuppressedOrcaWorkerAgentIslandSession(sessionId);
+    }
     return;
   }
   try {
@@ -3359,14 +3365,18 @@ function handleAgentIslandInteractionDismissed(sessionId: string, requestId: str
 function handleAgentIslandInteractionDismissedByRequestId(
   requestId: string,
   expectedSessionId?: string,
-): void {
+): boolean {
   try {
-    getAgentIslandService()?.handleInteractionDismissedByRequestId(requestId, expectedSessionId);
+    return (
+      getAgentIslandService()?.handleInteractionDismissedByRequestId(requestId, expectedSessionId) ??
+      false
+    );
   } catch (error) {
     log.warn('Agent Island interaction dismiss update failed by request id', {
       requestId,
       error: error instanceof Error ? error.message : String(error),
     });
+    return false;
   }
 }
 

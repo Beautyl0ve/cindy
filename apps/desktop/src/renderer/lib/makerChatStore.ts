@@ -2449,6 +2449,15 @@ export interface SessionChatState {
   sdkSessionId: string | null;
   /** F-PERM-2: Currently pending permission request; null when none. */
   pendingPermission: PendingPermission | null;
+  /**
+   * All unresolved permission request identities for this session.
+   *
+   * `pendingPermission` remains the single prompt rendered in the composer, but
+   * Worker attention must retain every concurrent request until main dismisses
+   * that exact request. Otherwise request B replacing request A would
+   * incorrectly clear A's unread attention.
+   */
+  pendingPermissionRequestIds: readonly string[];
   /** F7.2: Currently pending ask-user-question; null when none. */
   pendingAskUser: PendingAskUser | null;
   /** Host-owned plugin setup snapshot; updates replace by monotonic revision. */
@@ -2742,6 +2751,7 @@ function createInitialState(): SessionChatState {
     streamingClientId: null,
     streamingText: '',
     pendingPermission: null,
+    pendingPermissionRequestIds: [],
     pendingAskUser: null,
     pendingPluginSetup: null,
     pendingPluginSetupQueue: [],
@@ -2820,6 +2830,7 @@ export const EMPTY_SESSION_STATE: SessionChatState = Object.freeze({
   historyLoaded: true,
   sdkSessionId: null,
   pendingPermission: null,
+  pendingPermissionRequestIds: [],
   pendingAskUser: null,
   pendingPluginSetup: null,
   pendingPluginSetupQueue: [],
@@ -5367,6 +5378,7 @@ export function handleStreamEvent(
         activeTurnRetryText: null,
         errorRetryText: finalized.error ? finalized.errorRetryText : null,
         pendingPermission: null,
+        pendingPermissionRequestIds: [],
         pendingAskUser: keepAskUserAcrossDone ? state.pendingAskUser : null,
         continuationTurnClientId: null,
         // F-AUQ-MIN-5: viewerState lives with pendingAskUser — when the
@@ -5579,6 +5591,7 @@ export function handleStreamEvent(
         // the 'done' path to consume — reset it explicitly on error so the
         // accumulated delta text doesn't linger in memory.
         pendingPermission: null,
+        pendingPermissionRequestIds: [],
         pendingAskUser: null,
         // F-AUQ-MIN-5: same reset as the 'done' path.
         askUserViewerState: 'expanded',
@@ -5615,6 +5628,9 @@ export function handleStreamEvent(
       };
       return {
         ...state,
+        pendingPermissionRequestIds: state.pendingPermissionRequestIds.includes(data.requestId)
+          ? state.pendingPermissionRequestIds
+          : [...state.pendingPermissionRequestIds, data.requestId],
         pendingPermission: {
           requestId: data.requestId,
           toolName: data.toolName,
@@ -5641,8 +5657,14 @@ export function handleStreamEvent(
         data.reason === 'resolved' && data.decision && typeof data.decision === 'object'
           ? (data.decision as Record<string, unknown>)
           : null;
+      const pendingPermissionRequestIds = state.pendingPermissionRequestIds.filter(
+        (requestId) => requestId !== data.requestId,
+      );
       if (state.pendingPermission?.requestId === data.requestId) {
-        return { ...state, pendingPermission: null };
+        return { ...state, pendingPermission: null, pendingPermissionRequestIds };
+      }
+      if (pendingPermissionRequestIds.length !== state.pendingPermissionRequestIds.length) {
+        return { ...state, pendingPermissionRequestIds };
       }
       if (state.pendingPluginSetup?.requestId === data.requestId) {
         const [nextSetup = null, ...remainingSetups] = state.pendingPluginSetupQueue;
@@ -6037,6 +6059,7 @@ function forceFinalizeOnSessionClosed(state: SessionChatState): SessionChatState
     activeTurnRetryText: null,
     errorRetryText: null,
     pendingPermission: null,
+    pendingPermissionRequestIds: [],
     pendingAskUser: null,
     pendingPluginSetup: null,
     pendingPluginSetupQueue: [],
@@ -8710,6 +8733,7 @@ function subscribeAll(cb: () => void): () => void {
  * `hasPendingAskUser`    — session is waiting for user to answer a question.
  * `hasPendingPermission` — session is waiting for user to grant permission.
  * `pendingPermissionRequestId` — safe identity for exact attention cleanup.
+ * `pendingPermissionRequestIds` — all unresolved permission identities.
  * `hasPendingPlanReview` — session is waiting for user to review a plan (FP-3).
  * `hasPendingPluginSetup` — session is waiting for local plugin setup.
  */
@@ -8721,6 +8745,7 @@ export interface SessionStatusInfo {
   hasPendingAskUser: boolean;
   hasPendingPermission: boolean;
   pendingPermissionRequestId: string | null;
+  pendingPermissionRequestIds: readonly string[];
   hasPendingPlanReview: boolean;
   hasPendingPluginSetup: boolean;
 }
@@ -8779,7 +8804,8 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
   const next = new Map<string, SessionStatusInfo>();
   for (const [id, state] of sessions) {
     const hasPendingAskUser = state.pendingAskUser !== null;
-    const hasPendingPermission = state.pendingPermission !== null;
+    const pendingPermissionRequestIds = state.pendingPermissionRequestIds;
+    const hasPendingPermission = pendingPermissionRequestIds.length > 0;
     const pendingPermissionRequestId = state.pendingPermission?.requestId ?? null;
     const hasPendingPlanReview = state.pendingPlanReview !== null;
     const hasPendingPluginSetup = hasPendingPluginSetupInteraction(
@@ -8803,6 +8829,7 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
         hasPendingAskUser,
         hasPendingPermission,
         pendingPermissionRequestId,
+        pendingPermissionRequestIds,
         hasPendingPlanReview,
         hasPendingPluginSetup,
       });
@@ -8820,6 +8847,7 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
         hasPendingAskUser,
         hasPendingPermission,
         pendingPermissionRequestId,
+        pendingPermissionRequestIds,
         hasPendingPlanReview,
         hasPendingPluginSetup,
       });
@@ -8839,8 +8867,9 @@ function computeRunningSnapshot(): Map<string, SessionStatusInfo> {
       hasError: !!state.error && !state.lastStopWasSideTask,
       sideTask: state.lastStopWasSideTask,
       hasPendingAskUser: state.pendingAskUser !== null,
-      hasPendingPermission: state.pendingPermission !== null,
+      hasPendingPermission: state.pendingPermissionRequestIds.length > 0,
       pendingPermissionRequestId: state.pendingPermission?.requestId ?? null,
+      pendingPermissionRequestIds: state.pendingPermissionRequestIds,
       hasPendingPlanReview: state.pendingPlanReview !== null,
       hasPendingPluginSetup: hasPendingPluginSetupInteraction(
         state.pendingPluginSetup,
@@ -8883,6 +8912,7 @@ function getRunningSnapshot(): ReadonlyMap<string, SessionStatusInfo> {
         prev.hasPendingAskUser !== info.hasPendingAskUser ||
         prev.hasPendingPermission !== info.hasPendingPermission ||
         prev.pendingPermissionRequestId !== info.pendingPermissionRequestId ||
+        prev.pendingPermissionRequestIds !== info.pendingPermissionRequestIds ||
         prev.hasPendingPlanReview !== info.hasPendingPlanReview ||
         prev.hasPendingPluginSetup !== info.hasPendingPluginSetup
       ) {
@@ -13269,6 +13299,7 @@ function stopSession(
       activeTurnRetryText: null,
       errorRetryText: null,
       pendingPermission: null,
+      pendingPermissionRequestIds: [],
       continuationTurnClientId: null,
       pendingAskUser: null,
       // F-AUQ-MIN-5: Stop session — pending question is gone, reset viewer.
@@ -13713,6 +13744,7 @@ async function clearSessionAfterGuardImpl(sessionId: string, clearedAt: string):
       activeTurnRetryText: null,
       errorRetryText: null,
       pendingPermission: null,
+      pendingPermissionRequestIds: [],
       pendingAskUser: null,
       pendingPluginSetup: null,
       pendingPluginSetupQueue: [],
@@ -14008,7 +14040,13 @@ function respondToPermission(sessionId: string, result: CCAgentPermissionResult)
   bumpInteractionReconcileEpoch(sessionId);
 
   // Clear the pending permission immediately so the UI updates
-  setState(sessionId, (s) => ({ ...s, pendingPermission: null }));
+  setState(sessionId, (s) => ({
+    ...s,
+    pendingPermission: null,
+    pendingPermissionRequestIds: s.pendingPermissionRequestIds.filter(
+      (pendingRequestId) => pendingRequestId !== requestId,
+    ),
+  }));
 
   // Send to maker (InteractionDecision kind: 'permission')
   makerApiFor(sessionId)

@@ -1415,6 +1415,7 @@ describe('AgentIslandService native publishing', () => {
     // The pill counts waiting sessions, not requests; both requests share one Worker.
     expect(publish.mock.calls.at(-1)?.[0].pillSnapshot.pendingInteractionCount).toBe(1);
     expect(publish.mock.calls.at(-1)?.[0].sessions[0]?.permissionAction).toBeNull();
+    expect(service.hasPendingPermissionRequestForSession('worker-session')).toBe(true);
     expect(
       service.handleInteractionDismissedByRequestId('worker-permission-1', 'other-session'),
     ).toBe(false);
@@ -1429,11 +1430,13 @@ describe('AgentIslandService native publishing', () => {
       interactionKind: 'permission',
       permissionAction: null,
     });
+    expect(service.hasPendingPermissionRequestForSession('worker-session')).toBe(true);
 
     expect(
       service.handleInteractionDismissedByRequestId('worker-permission-2', 'worker-session'),
     ).toBe(true);
     expect(publish.mock.calls.at(-1)?.[0].pillSnapshot.pendingInteractionCount).toBe(0);
+    expect(service.hasPendingPermissionRequestForSession('worker-session')).toBe(false);
   });
 
   it('keeps permission routing through recoverable errors and clears it on terminal errors', async () => {

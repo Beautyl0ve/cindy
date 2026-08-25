@@ -12,23 +12,23 @@ function worker(overrides: Partial<WorkerAttentionRecord> = {}): WorkerAttention
     leadSessionId: 'lead-1',
     status: 'idle',
     focused: false,
-    pendingPermissionRequestId: null,
+    pendingPermissionRequestIds: [],
     ...overrides,
   };
 }
 
 function observed(
   status: WorkerAttentionObservedState['status'],
-  pendingPermissionRequestId: string | null,
+  pendingPermissionRequestIds: readonly string[],
 ): WorkerAttentionObservedState {
-  return { status, pendingPermissionRequestId };
+  return { status, pendingPermissionRequestIds };
 }
 
 describe('Worker attention projection', () => {
   it('projects permission and done as two simultaneous reasons', () => {
     const updates = computeWorkerAttentionUpdates(
       new Map(),
-      [worker({ status: 'done', pendingPermissionRequestId: 'permission-1' })],
+      [worker({ status: 'done', pendingPermissionRequestIds: ['permission-1'] })],
       undefined,
     );
 
@@ -42,19 +42,19 @@ describe('Worker attention projection', () => {
     expect(updates.toClear).toEqual([]);
   });
 
-  it('clears and replaces only the resolved permission request', () => {
+  it('keeps the earlier permission when a concurrent request arrives', () => {
     const updates = computeWorkerAttentionUpdates(
-      new Map([['worker-1', observed('done', 'permission-1')]]),
-      [worker({ status: 'done', pendingPermissionRequestId: 'permission-2' })],
+      new Map([['worker-1', observed('done', ['permission-1'])]]),
+      [
+        worker({
+          status: 'done',
+          pendingPermissionRequestIds: ['permission-1', 'permission-2'],
+        }),
+      ],
       undefined,
     );
 
-    expect(updates.toClear).toEqual([
-      {
-        workerId: 'worker-1',
-        reason: { kind: 'permission', requestId: 'permission-1' },
-      },
-    ]);
+    expect(updates.toClear).toEqual([]);
     expect(updates.toMark).toEqual([
       {
         workerId: 'worker-1',
@@ -66,15 +66,15 @@ describe('Worker attention projection', () => {
   it('keeps other Workers and other reasons intact during resolution', () => {
     const updates = computeWorkerAttentionUpdates(
       new Map([
-        ['worker-1', observed('running', 'permission-1')],
-        ['worker-2', observed('idle', 'permission-2')],
+        ['worker-1', observed('running', ['permission-1'])],
+        ['worker-2', observed('idle', ['permission-2'])],
       ]),
       [
-        worker({ status: 'done', pendingPermissionRequestId: null }),
+        worker({ status: 'done', pendingPermissionRequestIds: [] }),
         worker({
           workerId: 'worker-2',
           leadSessionId: 'lead-2',
-          pendingPermissionRequestId: 'permission-2',
+          pendingPermissionRequestIds: ['permission-2'],
         }),
       ],
       undefined,
@@ -97,7 +97,7 @@ describe('Worker attention projection', () => {
         worker({
           status: 'done',
           focused: true,
-          pendingPermissionRequestId: 'permission-focused',
+          pendingPermissionRequestIds: ['permission-focused'],
         }),
       ],
       'lead-1',
@@ -113,7 +113,7 @@ describe('Worker attention projection', () => {
 
   it('prunes every reason when a Worker session leaves the team', () => {
     const updates = computeWorkerAttentionUpdates(
-      new Map([['worker-1', observed('done', 'permission-1')]]),
+      new Map([['worker-1', observed('done', ['permission-1'])]]),
       [],
       undefined,
     );

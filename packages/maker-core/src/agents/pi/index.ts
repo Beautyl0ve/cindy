@@ -2441,6 +2441,7 @@ export class PiAgent extends BaseAgent {
 
     const queue: AsyncQueue<AgentEvent> = createAsyncQueue<AgentEvent>();
     const ctx: PiTranslateContext = createPiTranslateContext(this.deps.logger);
+    ctx.getPriceVariant = opts.getPriceVariant;
     const contextModeRoot = findContextModePackageRoot(managedPackageResources.packageRoots);
     ctx.rewriteToolResultText = (text) => rewriteContextModeDoctorPath(text, contextModeRoot);
     let interactionResolver: InteractionResolver | null = null;
@@ -2462,6 +2463,7 @@ export class PiAgent extends BaseAgent {
     let mutablePiProviderId = initialProvider;
     let mutableProviderId: string | null | undefined = opts.providerId ?? authProviderId;
     let activeEffortSnapshot = initialEffortSnapshot;
+    let mutableEffort: Effort | null = startupEffort ?? null;
     let currentAutoReviewIntent = '';
     const autoReviewDecisionCache = new Map<string, Promise<AutoReviewDecision>>();
     const setAutoReviewIntent = (content: UserMessage['content']): void => {
@@ -5296,6 +5298,11 @@ export class PiAgent extends BaseAgent {
           level: effortToPiThinkingLevel(effort),
         }));
         if (!resp.success) throw new Error(`pi set_thinking_level failed: ${resp.error ?? 'unknown'}`);
+        mutableEffort = effort;
+      },
+
+      getEffort() {
+        return mutableEffort;
       },
 
       async setThinkingEnabled(enabled: boolean): Promise<void> {

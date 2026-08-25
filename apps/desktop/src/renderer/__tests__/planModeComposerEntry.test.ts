@@ -11,7 +11,7 @@
  *     (编辑反馈时批准行 ⏎ 隐藏,反馈 ⏎ 仅在有文字时出现且可点击发送)
  */
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
@@ -470,6 +470,32 @@ describe('PlanActionCard 取消(Esc)与 ⏎ 去重', () => {
     await waitFor(() => expect(approve.disabled).toBe(false));
     fireEvent.click(approve);
     expect(onRespond).toHaveBeenCalledTimes(2);
+  });
+
+  it('旧 request 的异步失败不会解锁新 request 的提交', async () => {
+    const finish = new Map<string, (accepted: boolean) => void>();
+    const onRespond = vi.fn(
+      (requestId: string) =>
+        new Promise<boolean>((resolve) => {
+          finish.set(requestId, resolve);
+        }),
+    );
+    const { rerender } = render(createElement(PlanActionCard, { requestId: 'pr-old', onRespond }));
+
+    fireEvent.click(screen.getByText('newChat.planReview.approve').closest('button')!);
+    rerender(createElement(PlanActionCard, { requestId: 'pr-new', onRespond }));
+    const newApprove = screen.getByText('newChat.planReview.approve').closest('button')!;
+    fireEvent.click(newApprove);
+    expect(newApprove.disabled).toBe(true);
+
+    await act(async () => {
+      finish.get('pr-old')?.(false);
+      await Promise.resolve();
+    });
+    expect(newApprove.disabled).toBe(true);
+
+    finish.get('pr-new')?.(false);
+    await waitFor(() => expect(newApprove.disabled).toBe(false));
   });
 
   it('仅显式传入时显示实现模型选择器,反馈仍只走原响应通道', () => {

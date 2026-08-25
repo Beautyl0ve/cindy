@@ -866,7 +866,15 @@ import {
 import {
   applyRuntimeSetModelChange,
   isRemoteModelSwitchRouteChangeError,
+  RuntimeSetModelHotSwitchRequiredError,
 } from './runtimeSetModel.js';
+import {
+  assessPlanReviewModelContextSwitch,
+  PlanReviewModelApprovalCoordinator,
+  PlanReviewModelApprovalError,
+  resolveConservativePlanReviewContextTokens,
+  runPlanReviewModelApprovalTransaction,
+} from './planReviewModelApproval.js';
 import {
   applyRuntimeSelectionAxesWithRecovery,
   commitRuntimeAxisAfterPersistence,
@@ -2166,6 +2174,28 @@ interface PendingInteractionEntry {
 }
 
 const pendingInteractionResolvers = new Map<string, PendingInteractionEntry>();
+const planReviewModelApprovalCoordinator = new PlanReviewModelApprovalCoordinator();
+
+interface PlanReviewModelApprovalRequest {
+  requestId: string;
+  editedPlan: string;
+}
+
+function parsePlanReviewModelApproval(value: unknown): PlanReviewModelApprovalRequest | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throwIpcError('INVALID_PARAMS', 'planApproval must be an object');
+  }
+  const requestId = (value as { requestId?: unknown }).requestId;
+  const editedPlan = (value as { editedPlan?: unknown }).editedPlan;
+  if (typeof requestId !== 'string' || !requestId.trim()) {
+    throwIpcError('INVALID_PARAMS', 'planApproval.requestId required');
+  }
+  if (typeof editedPlan !== 'string' || editedPlan.length > 2_000_000) {
+    throwIpcError('INVALID_PARAMS', 'planApproval.editedPlan must be a bounded string');
+  }
+  return { requestId, editedPlan };
+}
 
 /**
  * submit_github_issue 工具的提交前确认桥(kind='issue_confirm')。独立于
@@ -2460,6 +2490,30 @@ function resolvePendingInteraction(requestId: string, decision: InteractionDecis
     }
   }
   return true;
+}
+
+function resolvePendingInteractionIfCurrent(
+  requestId: string,
+  expected: PendingInteractionEntry,
+  decision: InteractionDecision,
+): boolean {
+  if (pendingInteractionResolvers.get(requestId) !== expected) return false;
+  try {
+    return resolvePendingInteraction(requestId, decision);
+  } catch (error) {
+    // Clearing the exact resolver is the commit boundary. Later mirror or
+    // persistence notification failures must not make a committed approval
+    // look retryable to the renderer.
+    if (pendingInteractionResolvers.get(requestId) !== expected) {
+      log.error('plan approval post-commit notification failed', {
+        sessionId: expected.sessionId,
+        requestId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return true;
+    }
+    throw error;
+  }
 }
 
 function resolvePendingPermissionFromAgentIsland(
@@ -10863,6 +10917,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     fastExplicit?: boolean;
     /** False only for Agent axis-only patches; model/provider routing stays untouched. */
     routeExplicit?: boolean;
+    /** Plan approval must mutate the existing local Codex handle in place. */
+    requireHotSwitch?: boolean;
+    /** Caller already owns the per-session runtime/send lock. */
+    lockAlreadyHeld?: boolean;
   };
   let applySessionRuntimeSelection: (
     sessionId: string,
@@ -14502,6 +14560,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     MAKER_INVOKE.RESOLVE_INTERACTION,
     (event, requestId: unknown, decision: unknown) => {
       if (typeof requestId !== 'string') throwIpcError('INVALID_PARAMS', 'requestId required');
+      if (planReviewModelApprovalCoordinator.isReserved(requestId)) {
+        throwIpcError('PRECONDITION_FAILED', 'plan approval is already applying a model change');
+      }
       if (
         isPluginSetupInteractionDecision(decision) &&
         !parseGhostSetupInteractionCommand(decision)
@@ -15041,6 +15102,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
               // 解析隐式来源的凭证家族,精确判定是否跨远端压缩身份边界(见
               // shouldCloseSessionForCredentialSwitch.codexAuthInjection)。
               codexAuthInjection: getCodexProxyAuthInjectionState(),
+              requireHotSwitch: internalOptions.requireHotSwitch,
               logger: log,
             })
           : { status: 'applied' as const };
@@ -15291,8 +15353,266 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         throw err;
       }
     };
-    return withSendToSessionLock(sessionId, applyLocked);
+    return internalOptions.lockAlreadyHeld
+      ? applyLocked()
+      : withSendToSessionLock(sessionId, applyLocked);
   };
+
+  type PlanModelSnapshot = {
+    db: {
+      model: string;
+      providerId: string | null;
+      effort: SessionRuntimeProfile['effort'];
+      fastMode: boolean;
+    };
+    runtime: {
+      model: string;
+      providerId: string | null;
+      effort: SessionRuntimeProfile['effort'];
+      fastMode: boolean;
+    };
+    contextTokens: number;
+  };
+
+  const handlePlanReviewModelApproval = async (
+    event: Electron.IpcMainInvokeEvent,
+    sessionId: unknown,
+    model: unknown,
+    providerId: unknown,
+    selection: unknown,
+    rawPlanApproval: unknown,
+  ) => {
+    if (isDeviceLinkInvoke()) {
+      throwIpcError('UNSUPPORTED_CAPABILITY', 'plan implementation model selection is local-only');
+    }
+    assertTrustedAppRendererEvent(event);
+    const planApproval = parsePlanReviewModelApproval(rawPlanApproval);
+    if (
+      !planApproval ||
+      typeof sessionId !== 'string' ||
+      typeof model !== 'string' ||
+      typeof providerId !== 'string' ||
+      !selection ||
+      typeof selection !== 'object' ||
+      Array.isArray(selection) ||
+      !isSupportedRuntimeEffort((selection as { effort?: unknown }).effort) ||
+      typeof (selection as { fastMode?: unknown }).fastMode !== 'boolean'
+    ) {
+      throwIpcError(
+        'INVALID_PARAMS',
+        'plan implementation model selection requires provider, effort, and fastMode',
+      );
+    }
+    const planSelection = selection as {
+      effort: SessionRuntimeProfile['effort'];
+      fastMode: boolean;
+    };
+    const expectedPending = pendingInteractionResolvers.get(planApproval.requestId);
+    const liveSession = maker.getSession(sessionId);
+    if (
+      !expectedPending ||
+      expectedPending.sessionId !== sessionId ||
+      expectedPending.kind !== 'plan_review' ||
+      expectedPending.request.requestId !== planApproval.requestId
+    ) {
+      throwIpcError('PRECONDITION_FAILED', 'the selected plan review is no longer pending');
+    }
+    if (!liveSession || liveSession.agentKind !== 'codex' || !!liveSession.remoteHostId) {
+      throwIpcError(
+        'UNSUPPORTED_CAPABILITY',
+        'implementation model selection requires a live local Codex session',
+      );
+    }
+    if (agentSwitchPending.get(sessionId) || pendingCredentialSwitchHolder?.has(sessionId)) {
+      throwIpcError(
+        'PRECONDITION_FAILED',
+        'finish the pending model or agent switch before approving this plan',
+      );
+    }
+    const targetProviderId = normalizeSessionProviderId(providerId);
+    if (!targetProviderId || getSessionProvider(sessionId) !== targetProviderId) {
+      throw new RuntimeSetModelHotSwitchRequiredError(
+        'Plan approval can only hot-switch models on the current provider and credential route',
+      );
+    }
+
+    const rollbackPlanModelSelection = async (snapshot: PlanModelSnapshot): Promise<void> => {
+      const failures: unknown[] = [];
+      try {
+        await handleSetModel(
+          event,
+          sessionId,
+          snapshot.runtime.model,
+          snapshot.runtime.providerId,
+          undefined,
+          {
+            effort: snapshot.runtime.effort ?? snapshot.db.effort,
+            fastMode: snapshot.runtime.fastMode,
+          },
+          { source: 'user', requireHotSwitch: true, lockAlreadyHeld: true },
+        );
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        await persistSessionFields(sessionId, snapshot.db);
+      } catch (error) {
+        failures.push(error);
+      }
+      if (failures.length > 0) {
+        throw new AggregateError(failures, 'plan implementation model rollback failed');
+      }
+    };
+
+    try {
+      return await withSendToSessionLock(sessionId, () =>
+        runPlanReviewModelApprovalTransaction({
+          coordinator: planReviewModelApprovalCoordinator,
+          requestId: planApproval.requestId,
+          expectedPending,
+          readPending: () => pendingInteractionResolvers.get(planApproval.requestId),
+          captureSnapshot: async (): Promise<PlanModelSnapshot> => {
+            const [row] = await getDbClient()
+              .drizzle.select({
+                model: sessions.model,
+                providerId: sessions.providerId,
+                effort: sessions.effort,
+                fastMode: sessions.fastMode,
+                contextTokens: sessions.contextTokens,
+              })
+              .from(sessions)
+              .where(eq(sessions.id, sessionId))
+              .limit(1);
+            const currentLive = maker.getSession(sessionId);
+            if (!row || !currentLive || currentLive !== liveSession) {
+              throw new PlanReviewModelApprovalError(
+                'stale',
+                'the Codex session changed before its model could be updated',
+              );
+            }
+            if (!hasSessionProvider(sessionId)) {
+              hydrateSessionProvider(sessionId, row.providerId?.trim() || null);
+            }
+            const liveUsage = currentLive.getUsageSnapshot?.();
+            return {
+              db: {
+                model: row.model,
+                providerId: row.providerId?.trim() || null,
+                effort: row.effort as SessionRuntimeProfile['effort'],
+                fastMode: row.fastMode,
+              },
+              runtime: {
+                model: currentLive.model,
+                providerId: getSessionProvider(sessionId),
+                effort:
+                  (getSessionEffort(sessionId) as SessionRuntimeProfile['effort'] | undefined) ??
+                  (row.effort as SessionRuntimeProfile['effort']),
+                fastMode: getSessionFastMode(sessionId),
+              },
+              contextTokens: resolveConservativePlanReviewContextTokens(
+                row.contextTokens,
+                liveUsage?.contextTokens,
+              ),
+            };
+          },
+          revalidate: (snapshot) => {
+            const currentLive = maker.getSession(sessionId);
+            if (
+              !currentLive ||
+              currentLive !== liveSession ||
+              getSessionProvider(sessionId) !== snapshot.runtime.providerId ||
+              snapshot.runtime.providerId !== targetProviderId
+            ) {
+              throw new RuntimeSetModelHotSwitchRequiredError(
+                'The live provider or credential route changed before plan approval',
+              );
+            }
+            if (snapshot.runtime.model === model) return;
+            const targetContextWindow = lookupVerifiedContextWindow(
+              (agentKind, modelId, pid) =>
+                resolveVerifiedContextWindow(
+                  getActiveCatalog(),
+                  dbToMakerAgentKind(agentKind),
+                  pid,
+                  modelId,
+                ),
+              model,
+              targetProviderId,
+              currentLive.agentKind,
+            );
+            const contextAssessment = assessPlanReviewModelContextSwitch({
+              currentModel: snapshot.runtime.model,
+              targetModel: model,
+              contextTokens: snapshot.contextTokens,
+              targetContextWindow: targetContextWindow ?? undefined,
+              autoCompactThresholdPct: readCompactionPct(),
+            });
+            if (contextAssessment.requiresHandoff) {
+              throw new RuntimeSetModelHotSwitchRequiredError(
+                `Plan approval cannot hot-switch into a ${contextAssessment.level} context (${contextAssessment.projectedPct}% of the target window)`,
+              );
+            }
+          },
+          isUnchanged: (snapshot) =>
+            snapshot.runtime.model === model &&
+            snapshot.runtime.providerId === targetProviderId &&
+            snapshot.runtime.effort === planSelection.effort &&
+            snapshot.runtime.fastMode === planSelection.fastMode &&
+            snapshot.db.model === model &&
+            snapshot.db.providerId === targetProviderId &&
+            snapshot.db.effort === planSelection.effort &&
+            snapshot.db.fastMode === planSelection.fastMode,
+          unchangedValue: { deferred: false, superseded: false },
+          apply: async () => {
+            const response = await handleSetModel(
+              event,
+              sessionId,
+              model,
+              targetProviderId,
+              undefined,
+              planSelection,
+              { source: 'user', requireHotSwitch: true, lockAlreadyHeld: true },
+            );
+            if (response.deferred || response.superseded) {
+              throw new RuntimeSetModelHotSwitchRequiredError(
+                'plan implementation model was not applied immediately',
+              );
+            }
+            return response;
+          },
+          // The shared runtime-selection transaction persists the full profile
+          // before returning, while it still owns the session route lock.
+          persist: async () => {},
+          rollback: rollbackPlanModelSelection,
+          resolve: (expected) =>
+            resolvePendingInteractionIfCurrent(planApproval.requestId, expected, {
+              kind: 'plan_review',
+              behavior: 'allow',
+              editedPlan: planApproval.editedPlan,
+            }),
+        }),
+      );
+    } catch (error) {
+      if (
+        error instanceof RuntimeSetModelHotSwitchRequiredError ||
+        (error instanceof PlanReviewModelApprovalError && error.failure !== 'rollback_failed')
+      ) {
+        throwIpcError('PRECONDITION_FAILED', error.message);
+      }
+      if (error instanceof PlanReviewModelApprovalError && error.failure === 'rollback_failed') {
+        log.error('plan implementation model rollback failed', {
+          sessionId,
+          requestId: planApproval.requestId,
+        });
+        throwIpcError(
+          'INTERNAL',
+          'The model change could not be safely rolled back; the plan was not approved',
+        );
+      }
+      throw error;
+    }
+  };
+
   applySessionRuntimeSelection = (
     sessionId,
     model,
@@ -15311,16 +15631,33 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     );
   ipcMain.handle(
     MAKER_INVOKE.SET_MODEL,
-    (event, sessionId, model, providerId, expectedAgentSwitchRevision, selection) =>
-      handleSetModel(
-        event,
-        sessionId,
-        model,
-        providerId,
-        expectedAgentSwitchRevision,
-        selection,
-        { source: 'user' },
-      ),
+    (
+      event,
+      sessionId,
+      model,
+      providerId,
+      expectedAgentSwitchRevision,
+      selection,
+      planApproval,
+    ) =>
+      planApproval === undefined
+        ? handleSetModel(
+            event,
+            sessionId,
+            model,
+            providerId,
+            expectedAgentSwitchRevision,
+            selection,
+            { source: 'user' },
+          )
+        : handlePlanReviewModelApproval(
+            event,
+            sessionId,
+            model,
+            providerId,
+            selection,
+            planApproval,
+          ),
   );
 
   const recoverRemoteRuntimeAxisPersistence = async (

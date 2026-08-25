@@ -83,9 +83,11 @@ export function PlanActionCard({
   // so rapid double-clicks can't fire two IPC responses for the same requestId.
   const [submitted, setSubmitted] = useState(false);
   const submittedRef = useRef(false);
+  const submissionTokenRef = useRef<symbol | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
+    submissionTokenRef.current = null;
     submittedRef.current = false;
     setSubmitted(false);
     setFeedback('');
@@ -95,28 +97,31 @@ export function PlanActionCard({
   const beginSubmission = useCallback(
     (submit: () => void | boolean | Promise<void | boolean>) => {
       if (submittedRef.current) return;
+      const token = Symbol(requestId);
+      submissionTokenRef.current = token;
       submittedRef.current = true;
       setSubmitted(true);
+      const release = () => {
+        if (submissionTokenRef.current !== token) return;
+        submissionTokenRef.current = null;
+        submittedRef.current = false;
+        setSubmitted(false);
+      };
       let result: void | boolean | Promise<void | boolean>;
       try {
         result = submit();
       } catch {
-        submittedRef.current = false;
-        setSubmitted(false);
+        release();
         return;
       }
       void Promise.resolve(result)
         .then((accepted) => {
           if (accepted !== false) return;
-          submittedRef.current = false;
-          setSubmitted(false);
+          release();
         })
-        .catch(() => {
-          submittedRef.current = false;
-          setSubmitted(false);
-        });
+        .catch(release);
     },
-    [],
+    [requestId],
   );
 
   const handleApprove = useCallback(() => {

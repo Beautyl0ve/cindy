@@ -8,6 +8,7 @@ import {
 import {
   applyRuntimeSetModelChange,
   isRemoteModelSwitchRouteChangeError,
+  RuntimeSetModelHotSwitchRequiredError,
   type RuntimeSetModelMaker,
 } from '../runtimeSetModel.js';
 
@@ -60,6 +61,71 @@ describe('isRemoteModelSwitchRouteChangeError', () => {
 });
 
 describe('applyRuntimeSetModelChange', () => {
+  it('rejects a restart-required plan switch before mutating the route', async () => {
+    const sessionId = rememberSession('runtime-set-model-plan-no-restart');
+    setSessionProvider(sessionId, 'openai');
+    const setModel = vi.fn(async () => {});
+    const closeSession = vi.fn(async () => {});
+    const registerPendingCredentialSwitch = vi.fn();
+    const maker: RuntimeSetModelMaker = {
+      getSession: () => ({
+        agentKind: 'codex',
+        remoteHostId: null,
+        model: 'gpt-5.4',
+        setModel,
+      }),
+      listActiveSessions: () => [],
+      closeSession,
+    };
+
+    await expect(
+      applyRuntimeSetModelChange({
+        maker,
+        sessionId,
+        model: 'codex/gpt-5.5',
+        providerId: 'xd',
+        requireHotSwitch: true,
+        registerPendingCredentialSwitch,
+      }),
+    ).rejects.toBeInstanceOf(RuntimeSetModelHotSwitchRequiredError);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(registerPendingCredentialSwitch).not.toHaveBeenCalled();
+    expect(setModel).not.toHaveBeenCalled();
+    expect(getSessionProvider(sessionId)).toBe('openai');
+  });
+
+  it('allows an in-place local Codex model change for plan approval', async () => {
+    const sessionId = rememberSession('runtime-set-model-plan-hot');
+    setSessionProvider(sessionId, 'openai');
+    const setModel = vi.fn(async () => {});
+    const maker: RuntimeSetModelMaker = {
+      getSession: () => ({
+        agentKind: 'codex',
+        remoteHostId: null,
+        model: 'gpt-5.4',
+        setModel,
+      }),
+      listActiveSessions: () => [],
+      closeSession: vi.fn(async () => {}),
+    };
+
+    await expect(
+      applyRuntimeSetModelChange({
+        maker,
+        sessionId,
+        model: 'gpt-5.5',
+        providerId: 'openai',
+        effort: 'high',
+        requireHotSwitch: true,
+      }),
+    ).resolves.toEqual({ status: 'applied' });
+    expect(setModel).toHaveBeenCalledWith('gpt-5.5', {
+      providerId: 'openai',
+      effort: 'high',
+    });
+  });
+
   it('rolls back provider route when live setModel rejects', async () => {
     const sessionId = rememberSession('runtime-set-model-rollback');
     setSessionProvider(sessionId, 'xd');

@@ -468,9 +468,8 @@ describe('sendToSession ordering', () => {
       'ipcMain.handle(MAKER_INVOKE.MARK_ORCA_ROLE',
     );
 
-    expect(setModelBlock).toContain(
-      'return withSendToSessionLock(sessionId, applyLocked);',
-    );
+    expect(setModelBlock).toContain('return internalOptions.lockAlreadyHeld');
+    expect(setModelBlock).toContain(': withSendToSessionLock(sessionId, applyLocked);');
     expect(setModelBlock).toContain(
       'agentSwitchPending.revision?.(sessionId) !== expectedAgentSwitchRevision',
     );
@@ -552,6 +551,26 @@ describe('sendToSession ordering', () => {
     );
     expectOrder(directSendSwitchBlock, 'applyPendingAgentSwitchIfIdle(', 'prepareUnhealthySession');
     expectOrder(directSendSwitchBlock, 'prepareUnhealthySession', 'return release;');
+  });
+
+  it('reserves the exact plan before hot-switching through the shared runtime transaction', () => {
+    const planApprovalBlock = extractBetween(
+      source,
+      'const handlePlanReviewModelApproval = async (',
+      'applySessionRuntimeSelection = (',
+    );
+
+    expect(planApprovalBlock).toContain('runPlanReviewModelApprovalTransaction({');
+    expect(planApprovalBlock).toContain('readPending: () => pendingInteractionResolvers.get(');
+    expect(planApprovalBlock).toContain("source: 'user', requireHotSwitch: true");
+    expect(planApprovalBlock).toContain('withSendToSessionLock(sessionId');
+    expect(planApprovalBlock).toContain('lockAlreadyHeld: true');
+    expect(planApprovalBlock).toContain('rollback: rollbackPlanModelSelection');
+    expect(planApprovalBlock).toContain('resolvePendingInteractionIfCurrent(');
+    expectOrder(planApprovalBlock, 'captureSnapshot: async ()', 'apply: async () =>');
+    expectOrder(planApprovalBlock, 'apply: async () =>', 'resolve: (expected) =>');
+    expect(source).toContain('planReviewModelApprovalCoordinator.isReserved(requestId)');
+    expect(preloadSource).toContain('approvePlanReviewWithModel: (input: {');
   });
 
   it('仅 Device Link 归一化 SET_MODEL 的 JSON null 可选占位,本地仍走严格校验', () => {

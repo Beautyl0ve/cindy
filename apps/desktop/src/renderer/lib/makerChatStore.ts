@@ -4816,6 +4816,55 @@ function removePendingPermissionRequest(
   };
 }
 
+function reconcilePendingPermissionSnapshot(
+  state: SessionChatState,
+  authoritativeRequestIds: ReadonlySet<string>,
+): SessionChatState {
+  let pendingPermissions = state.pendingPermissions.filter((permission) =>
+    authoritativeRequestIds.has(permission.requestId),
+  );
+  const currentPermission =
+    state.pendingPermission && authoritativeRequestIds.has(state.pendingPermission.requestId)
+      ? state.pendingPermission
+      : null;
+  if (
+    currentPermission &&
+    !pendingPermissions.some(
+      (permission) => permission.requestId === currentPermission.requestId,
+    )
+  ) {
+    pendingPermissions = [...pendingPermissions, currentPermission];
+  }
+  const pendingPermission =
+    currentPermission ?? pendingPermissions[pendingPermissions.length - 1] ?? null;
+  const pendingPermissionRequestIds = pendingPermissions.map(
+    (permission) => permission.requestId,
+  );
+  const projectionsUnchanged =
+    pendingPermissions.length === state.pendingPermissions.length &&
+    pendingPermissions.every(
+      (permission, index) => permission === state.pendingPermissions[index],
+    );
+  const identitiesUnchanged =
+    pendingPermissionRequestIds.length === state.pendingPermissionRequestIds.length &&
+    pendingPermissionRequestIds.every(
+      (requestId, index) => requestId === state.pendingPermissionRequestIds[index],
+    );
+  if (
+    projectionsUnchanged &&
+    identitiesUnchanged &&
+    pendingPermission === state.pendingPermission
+  ) {
+    return state;
+  }
+  return {
+    ...state,
+    pendingPermission,
+    pendingPermissions,
+    pendingPermissionRequestIds,
+  };
+}
+
 // F1-a: 所有 agent 消息(assistant/tool_use/tool_result/thinking/ask_user/plan_review)
 // 的落库已收口 main(messagePersistBroadcaster),handleStreamEvent 退化为纯 UI reducer、
 // 不再写库 → 不再需要 sessionId 形参(已从签名移除,各调用点同步去掉第三个实参)。
@@ -9116,14 +9165,21 @@ function reconcilePendingInteractions(
     const run = interactionApi.getPendingInteractions(sessionId).then((list) => {
       if (!isCurrentInteractionReconcile()) return 0;
       if (!Array.isArray(list)) return 0;
-      // A successful list response is the Host-authoritative snapshot for Setup
-      // interactions. Reconcile it subtractively before replaying the snapshot so
-      // a Device Link reconnect cannot leave cards that the Host already closed.
-      // Other interaction kinds keep their existing replay semantics.
+      // A successful list response is the Host-authoritative snapshot. Reconcile
+      // ephemeral interactions subtractively before replaying it so a Device Link
+      // reconnect cannot leave cards that the Host already closed.
+      const authoritativePermissionIds = new Set<string>();
       const authoritativePluginSetupIds = new Set<string>();
       const authoritativeRemoteDesktopConfirmationIds = new Set<string>();
       for (const item of list) {
         const request = item?.request;
+        if (
+          request?.kind === 'permission' &&
+          typeof request.requestId === 'string' &&
+          request.requestId.length > 0
+        ) {
+          authoritativePermissionIds.add(request.requestId);
+        }
         if (
           request?.kind === 'plugin_setup' &&
           typeof request.requestId === 'string' &&
@@ -9143,6 +9199,10 @@ function reconcilePendingInteractions(
       }
       if (!isCurrentInteractionReconcile()) return 0;
       setState(sessionId, (state) => {
+        const permissionState = reconcilePendingPermissionSnapshot(
+          state,
+          authoritativePermissionIds,
+        );
         const currentSurvives =
           state.pendingPluginSetup !== null &&
           authoritativePluginSetupIds.has(state.pendingPluginSetup.requestId);
@@ -9191,6 +9251,7 @@ function reconcilePendingInteractions(
           );
 
         if (
+          permissionState === state &&
           !currentChanged &&
           !queueChanged &&
           nextCommand === state.pluginSetupCommandInFlight &&
@@ -9200,7 +9261,7 @@ function reconcilePendingInteractions(
           return state;
         }
         return {
-          ...state,
+          ...permissionState,
           pendingPluginSetup: nextCurrent,
           pendingPluginSetupQueue: survivingQueue,
           pluginSetupViewerState: currentChanged ? 'expanded' : state.pluginSetupViewerState,
@@ -14103,9 +14164,14 @@ function respondToPermission(
       }
       return true;
     })
-    .catch((err) => {
+    .catch(async (err) => {
       log.error('Failed to respond to permission:', err);
-      return false;
+      try {
+        await reconcilePendingInteractions(sessionId);
+      } catch {
+        return false;
+      }
+      return !(sessions.get(sessionId)?.pendingPermissionRequestIds.includes(requestId) ?? false);
     })
     .finally(() => {
       if (permissionResponsesInFlight.get(sessionId)?.promise === promise) {

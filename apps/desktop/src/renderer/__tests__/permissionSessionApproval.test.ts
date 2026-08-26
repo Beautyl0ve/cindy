@@ -53,6 +53,7 @@ type ListenerKey = 'event' | 'statusChanged' | 'inputProjection' | 'interaction'
 
 let listeners: Partial<Record<ListenerKey, (data: unknown) => void>>;
 let resolveInteraction: ReturnType<typeof vi.fn>;
+let getPendingInteractions: ReturnType<typeof vi.fn>;
 let listActive: ReturnType<typeof vi.fn>;
 
 function subscribe(key: ListenerKey) {
@@ -64,6 +65,7 @@ function subscribe(key: ListenerKey) {
 
 function installElectronBridge(): void {
   resolveInteraction = vi.fn(async () => {});
+  getPendingInteractions = vi.fn(async () => []);
   listActive = vi.fn(async () => []);
   listeners = {};
   const w = globalThis as unknown as { window: Record<string, unknown> };
@@ -90,6 +92,7 @@ function installElectronBridge(): void {
             errorRetryText: null,
           })),
         },
+        getPendingInteractions,
         resolveInteraction,
         send: vi.fn(async () => {}),
         generateTitle: vi.fn(async () => ({ title: 't' })),
@@ -274,6 +277,16 @@ describe('permission interaction IPC', () => {
 
   it('keeps the permission card and attention available when main rejects the decision', async () => {
     resolveInteraction.mockRejectedValueOnce(new Error('device link disconnected'));
+    getPendingInteractions.mockResolvedValueOnce([
+      {
+        request: {
+          kind: 'permission',
+          requestId: 'perm-retry',
+          toolName: 'Bash',
+          input: { command: 'pnpm test' },
+        },
+      },
+    ]);
     makerChatStore.initGlobalListeners();
     listeners.interaction?.({
       sessionId: SESSION_ID,
@@ -294,6 +307,30 @@ describe('permission interaction IPC', () => {
     expect(
       makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestIds,
     ).toEqual(['perm-retry']);
+  });
+
+  it('removes an ambiguous failed decision when the authoritative snapshot accepted it', async () => {
+    resolveInteraction.mockRejectedValueOnce(new Error('device link disconnected'));
+    getPendingInteractions.mockResolvedValueOnce([]);
+    makerChatStore.initGlobalListeners();
+    listeners.interaction?.({
+      sessionId: SESSION_ID,
+      request: {
+        kind: 'permission',
+        requestId: 'perm-accepted-remotely',
+        toolName: 'Bash',
+        input: { command: 'pnpm test' },
+      },
+    });
+
+    await expect(
+      makerChatStore.respondToPermission(SESSION_ID, { behavior: 'allow' }),
+    ).resolves.toBe(true);
+    expect(getPendingInteractions).toHaveBeenCalledWith(SESSION_ID);
+    expect(makerChatStore.getSnapshot(SESSION_ID).pendingPermission).toBeNull();
+    expect(
+      makerChatStore.getRunningSnapshot().get(SESSION_ID)?.pendingPermissionRequestIds ?? [],
+    ).toEqual([]);
   });
 });
 

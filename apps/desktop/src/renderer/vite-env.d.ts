@@ -3428,6 +3428,9 @@ interface ElectronAPI {
     /** 本窗口草稿附件 URL 变化时上报(fire-and-forget;多窗口防误删取证)。 */
     reportDraftUrls: (urls: string[]) => void;
     openLegacyImagesDir: () => Promise<{ opened: boolean }>;
+    clearLegacyImagesDir: () => Promise<{ cleared: boolean }>;
+    openChatAttachmentsDir: () => Promise<{ opened: boolean }>;
+    clearChatAttachmentsDir: () => Promise<{ cleared: boolean }>;
     stats: () => Promise<{
       success: boolean;
       error?: string;
@@ -3897,10 +3900,7 @@ interface ElectronAPI {
     reason?: 'gone' | 'no-worktree' | 'git-error';
     detail?: string;
   }>;
-  /**
-   * 「worktree 回收链已跑完」推送。归档/删除后 main 侧的回收是 fire-and-forget 的
-   * 异步链，store 条目移除远晚于状态 IPC 返回，renderer 必须等这条才能拿到真实快照。
-   */
+  /** worktree 回收完成后，按实际受影响的 sessionId 增量更新本机缓存。 */
   onWorktreeChanged: (callback: (payload: { sessionId: string }) => void) => () => void;
 
   // ── Slack Hook(中心 slack-hook-server 接入) ── 类型正本在 shared/hookControlIpc.ts
@@ -4243,10 +4243,37 @@ interface ElectronAPI {
           };
         }
     >;
+    maintenance: {
+      scan: (
+        input: import('../shared/localDbMaintenance').DbSlimmingScanInput,
+      ) => Promise<import('../shared/localDbMaintenance').DbSlimmingScanResult>;
+      chooseBackupDirectory: () => Promise<
+        import('../shared/localDbMaintenance').DbSlimmingBackupDirectorySelection
+      >;
+      schedule: (
+        input: import('../shared/localDbMaintenance').DbSlimmingScheduleInput,
+      ) => Promise<import('../shared/localDbMaintenance').DbSlimmingScheduleResult>;
+      getLastResult: () => Promise<
+        import('../shared/localDbMaintenance').DbSlimmingResult | null
+      >;
+      openLastBackupDirectory: () => Promise<{ opened: boolean }>;
+      getStartupProgress: () => Promise<
+        import('../shared/localDbMaintenance').DbSlimmingStartupProgress | null
+      >;
+      cancelStartup: () => Promise<
+        import('../shared/localDbMaintenance').DbSlimmingStartupCancelResult
+      >;
+      onStartupProgress: (
+        callback: (
+          progress: import('../shared/localDbMaintenance').DbSlimmingStartupProgress | null,
+        ) => void,
+      ) => () => void;
+    };
     sessions: {
       list: (
         limit?: number,
         status?: 'active' | 'archived' | 'all',
+        options?: { includePinned?: boolean; fresh?: boolean },
       ) => Promise<import('@/lib/ccAgent.types').Session[]>;
       create: (body?: {
         id?: string;
@@ -5032,7 +5059,6 @@ interface ElectronAPI {
       focus?: string;
       attachments?: import('./lib/fileTypes').SerializedAttachedFile[];
     }) => Promise<{ ok: true; runId: string; reviewerSessionId: string }>;
-
     listAgentCommands: (
       agentKind: 'claude-code' | 'codex' | 'pi',
       params?: { sessionId?: string; allowManagedPiPackagePreview?: boolean },
@@ -5677,8 +5703,22 @@ interface ElectronAPI {
     /** 写入后返回 main 端 clamp 后的最终百分比 */
     compactionSetPct: (
       pct: number,
+      owner: { dataOwnerId: string | null; ownerGeneration: number },
     ) => Promise<{ pct: number; isCustomized: boolean; defaultPct: number }>;
-    compactionResetPct: () => Promise<{ pct: number; isCustomized: boolean; defaultPct: number }>;
+    compactionResetPct: (
+      owner: { dataOwnerId: string | null; ownerGeneration: number },
+    ) => Promise<{ pct: number; isCustomized: boolean; defaultPct: number }>;
+
+    /** Pi 原生自动上下文压缩触发百分比。下次启动或恢复 Pi 任务时生效 */
+    piCompactionGetPct: () => Promise<number>;
+    piCompactionGetState: () => Promise<{ pct: number; isCustomized: boolean; defaultPct: number }>;
+    piCompactionSetPct: (
+      pct: number,
+      owner: { dataOwnerId: string | null; ownerGeneration: number },
+    ) => Promise<{ pct: number; isCustomized: boolean; defaultPct: number }>;
+    piCompactionResetPct: (
+      owner: { dataOwnerId: string | null; ownerGeneration: number },
+    ) => Promise<{ pct: number; isCustomized: boolean; defaultPct: number }>;
 
     /** LSP Beta 开关 — 控制 mcp providers 是否注入 lsp_* 工具 (默认 false) */
     lspModeGet: () => Promise<{ enabled: boolean }>;

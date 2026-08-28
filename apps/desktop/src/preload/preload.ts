@@ -148,6 +148,7 @@ import {
 import { isDataOwnerPushStamp, type DataOwnerPushStamp } from '../shared/dataOwnerPush';
 import type { VoiceInputSyncErrorResult } from '../shared/voiceInputData';
 import type { UtilityTextFailure } from '../shared/utilityTextResult';
+import { DB_SLIMMING_STARTUP_PROGRESS_CHANGED_CHANNEL } from '../shared/localDbMaintenance';
 import type { BrowserBackendHealth, BrowserBackendRecoveryResult } from '../shared/browserBackend';
 import type {
   ReviewBranchDiffData,
@@ -431,6 +432,9 @@ function createIpcFanOut(channel: string): FanOut {
 // Stage 2 C1: cc-agent:* push channel fanout 全部退役 (renderer 已切到 maker:event 等),
 // 老 7 个 fanOut + fanOutUserMessagePersisted 一起拿掉。
 const fanOutUpdateStatus = createIpcFanOut('update-status');
+const fanOutDbSlimmingStartupProgress = createIpcFanOut(
+  DB_SLIMMING_STARTUP_PROGRESS_CHANGED_CHANNEL,
+);
 const fanOutUpdateChannelSettings = createIpcFanOut('update-channel-settings');
 const fanOutWindowBackdropMaterialChanged = createIpcFanOut(
   WINDOW_BACKDROP_MATERIAL_CHANGED_CHANNEL,
@@ -3836,6 +3840,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     openLegacyImagesDir: (): Promise<{ opened: boolean }> =>
       ipcRenderer.invoke('cindy-media:legacy-images-open-dir'),
 
+    clearLegacyImagesDir: (): Promise<{ cleared: boolean }> =>
+      ipcRenderer.invoke('cindy-media:legacy-images-clear'),
+
+    openChatAttachmentsDir: (): Promise<{ opened: boolean }> =>
+      ipcRenderer.invoke('cindy-media:chat-attachments-open-dir'),
+
+    clearChatAttachmentsDir: (): Promise<{ cleared: boolean }> =>
+      ipcRenderer.invoke('cindy-media:chat-attachments-clear'),
+
     stats: (): Promise<{
       success: boolean;
       error?: string;
@@ -4443,11 +4456,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     sessionId: string,
   ): Promise<{ ok: boolean; snapshotApplied?: boolean; message?: string }> =>
     ipcRenderer.invoke('worktree:restore-for-session', sessionId),
-  /**
-   * 订阅「worktree 回收链已跑完」。payload: { sessionId }。
-   * 归档/删除后 main 侧的回收是 fire-and-forget 的异步链,store 条目移除远晚于状态
-   * IPC 返回;renderer 只在动作里刷一次会拿到旧快照,徽标就一直陈旧。
-   */
+  /** worktree 回收完成后，按实际受影响的 sessionId 增量更新 renderer 缓存。 */
   onWorktreeChanged: fanOutWorktreeChanged,
 
   // ── Slack Hook(公司中心 slack-hook-server 接入, 单内置连接) ─────────────
@@ -4496,7 +4505,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       action: 'connect' | 'provider' | 'add-to-group',
     ): Promise<{ ok: true }> =>
       ipcRenderer.invoke('maker:hook-control:provider-open-action', { provider, action }),
-    // 目录偏好远程读写(数据正本在 slack-hook-server, 与 Slack /model 卡同一份;
+    // 目录偏好本机读写(正本在本地; 连上后镜像到 hook server 供 /model 卡使用;
     // teamId 为 multi-team 下的归属 team, 单绑定缺省)
     getWorkspacePrefs: (): Promise<{ prefs: unknown }> =>
       ipcRenderer.invoke('maker:hook-control:prefs-get'),
@@ -4842,9 +4851,43 @@ contextBridge.exposeInMainWorld('electronAPI', {
       userId: string,
     ): Promise<{ ready: true } | { ready: false; error: { code: string; message: string } }> =>
       ipcRenderer.invoke('local-db:ensure-ready', userId),
+    maintenance: {
+      scan: (
+        input: import('../shared/localDbMaintenance').DbSlimmingScanInput,
+      ): Promise<import('../shared/localDbMaintenance').DbSlimmingScanResult> =>
+        ipcRenderer.invoke('local-db:maintenance:scan', input),
+      chooseBackupDirectory: (): Promise<
+        import('../shared/localDbMaintenance').DbSlimmingBackupDirectorySelection
+      > => ipcRenderer.invoke('local-db:maintenance:choose-backup-directory'),
+      schedule: (
+        input: import('../shared/localDbMaintenance').DbSlimmingScheduleInput,
+      ): Promise<import('../shared/localDbMaintenance').DbSlimmingScheduleResult> =>
+        ipcRenderer.invoke('local-db:maintenance:schedule', input),
+      getLastResult: (): Promise<
+        import('../shared/localDbMaintenance').DbSlimmingResult | null
+      > => ipcRenderer.invoke('local-db:maintenance:last-result'),
+      openLastBackupDirectory: (): Promise<{ opened: boolean }> =>
+        ipcRenderer.invoke('local-db:maintenance:open-last-backup-directory'),
+      getStartupProgress: (): Promise<
+        import('../shared/localDbMaintenance').DbSlimmingStartupProgress | null
+      > => ipcRenderer.invoke('local-db:maintenance:startup-progress'),
+      cancelStartup: (): Promise<
+        import('../shared/localDbMaintenance').DbSlimmingStartupCancelResult
+      > => ipcRenderer.invoke('local-db:maintenance:cancel-startup'),
+      onStartupProgress: (
+        callback: (
+          progress: import('../shared/localDbMaintenance').DbSlimmingStartupProgress | null,
+        ) => void,
+      ): (() => void) =>
+        fanOutDbSlimmingStartupProgress((progress) => {
+          callback(
+            progress as import('../shared/localDbMaintenance').DbSlimmingStartupProgress | null,
+          );
+        }),
+    },
     sessions: {
-      list: (limit?: number, status?: string): Promise<unknown> =>
-        ipcRenderer.invoke('local-db:sessions:list', limit, status),
+      list: (limit?: number, status?: string, options?: unknown): Promise<unknown> =>
+        ipcRenderer.invoke('local-db:sessions:list', limit, status, options),
       create: (body?: unknown): Promise<unknown> =>
         ipcRenderer.invoke('local-db:sessions:create', body),
       get: (id: string): Promise<unknown> => ipcRenderer.invoke('local-db:sessions:get', id),
@@ -5570,7 +5613,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
       }>;
     }): Promise<{ ok: true; runId: string; reviewerSessionId: string }> =>
       ipcRenderer.invoke('maker:review:start', input),
-
     listAgentCommands: (
       agentKind: 'claude-code' | 'codex' | 'pi',
       params: { sessionId?: string; allowManagedPiPackagePreview?: boolean } = {},
@@ -6264,10 +6306,27 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('maker:compaction:get-state'),
     compactionSetPct: (
       pct: number,
+      owner: { dataOwnerId: string | null; ownerGeneration: number },
     ): Promise<{ pct: number; isCustomized: boolean; defaultPct: number }> =>
-      ipcRenderer.invoke('maker:compaction:set-pct', pct),
-    compactionResetPct: (): Promise<{ pct: number; isCustomized: boolean; defaultPct: number }> =>
-      ipcRenderer.invoke('maker:compaction:reset-pct'),
+      ipcRenderer.invoke('maker:compaction:set-pct', pct, owner),
+    compactionResetPct: (
+      owner: { dataOwnerId: string | null; ownerGeneration: number },
+    ): Promise<{ pct: number; isCustomized: boolean; defaultPct: number }> =>
+      ipcRenderer.invoke('maker:compaction:reset-pct', owner),
+
+    // Pi 原生自动上下文压缩阈值。下次启动或恢复 Pi 任务时生效。
+    piCompactionGetPct: (): Promise<number> => ipcRenderer.invoke('maker:pi-compaction:get-pct'),
+    piCompactionGetState: (): Promise<{ pct: number; isCustomized: boolean; defaultPct: number }> =>
+      ipcRenderer.invoke('maker:pi-compaction:get-state'),
+    piCompactionSetPct: (
+      pct: number,
+      owner: { dataOwnerId: string | null; ownerGeneration: number },
+    ): Promise<{ pct: number; isCustomized: boolean; defaultPct: number }> =>
+      ipcRenderer.invoke('maker:pi-compaction:set-pct', pct, owner),
+    piCompactionResetPct: (
+      owner: { dataOwnerId: string | null; ownerGeneration: number },
+    ): Promise<{ pct: number; isCustomized: boolean; defaultPct: number }> =>
+      ipcRenderer.invoke('maker:pi-compaction:reset-pct', owner),
 
     // LSP Beta 开关 —— 控制 mcp providers 是否注入 lsp_* 工具 (Phase 1 Beta)。
     // 默认 false; 仅对**新 session** 生效, 已开 session 工具列表已固化, 不变。

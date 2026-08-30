@@ -3838,9 +3838,9 @@ async function readThreadsFromRollouts(
 ): Promise<CodexThreadReadResult> {
   const index = readSessionIndex(home);
   const files = await collectRolloutFilesAsync(home);
-  const out: CodexThreadSummary[] = [];
+  const indexedRows: Array<{ row: SqlRow; originalIndex: number }> = [];
   const rejectedThreadIds = new Set<string>();
-  for (const { file, mtime } of files) {
+  for (const [originalIndex, { file, mtime }] of files.entries()) {
     const fileThreadId = threadIdFromRolloutPath(file);
     const knownDbArchived = fileThreadId ? knownDbArchivedByThreadId?.get(fileThreadId) : undefined;
     if (knownDbArchived === true || (knownDbArchived === false && !isArchivedRolloutPath(file))) continue;
@@ -3851,7 +3851,17 @@ async function readThreadsFromRollouts(
       addRejectedThreadId(row, rejectedThreadIds);
       continue;
     }
-    if (out.length >= MAX_THREADS_PER_HOME) continue;
+    indexedRows.push({ row, originalIndex });
+  }
+  indexedRows.sort((left, right) => {
+    const byUpdatedAt =
+      threadRowOrderTimestamp(right.row) - threadRowOrderTimestamp(left.row);
+    return byUpdatedAt || left.originalIndex - right.originalIndex;
+  });
+
+  const out: CodexThreadSummary[] = [];
+  for (const { row } of indexedRows) {
+    if (out.length >= MAX_THREADS_PER_HOME) break;
     const thread = normalizeThreadRow(home, null, row, projectlessThreadIds);
     if (thread) out.push(thread);
   }

@@ -1002,6 +1002,49 @@ describe('Codex local session import', () => {
     expect(ids).toContain(`019dcd5a-6e54-7960-95e0-${String(1000).padStart(12, '0')}`);
   }, 15_000);
 
+  it('applies the session index time before capping rollout-only threads', async () => {
+    const sessionsDir = path.join(externalHome, 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const oldestId = `019dcd5a-6e54-7960-95e1-${'0'.padStart(12, '0')}`;
+    for (let i = 0; i < 1001; i += 1) {
+      const id = `019dcd5a-6e54-7960-95e1-${String(i).padStart(12, '0')}`;
+      const file = path.join(sessionsDir, `rollout-2026-05-13-${id}.jsonl`);
+      const timestamp = new Date(10_000 + i).toISOString();
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({
+          timestamp,
+          type: 'session_meta',
+          payload: {
+            id,
+            timestamp,
+            cwd: '/tmp/project',
+            source: 'cli',
+            model: 'gpt-5.5',
+            reasoning_effort: 'high',
+            approval_mode: 'on-request',
+          },
+        })}\n`,
+      );
+      fs.utimesSync(file, new Date(10_000 + i), new Date(10_000 + i));
+    }
+    writeSessionIndex({
+      id: oldestId,
+      thread_name: '   ',
+      updated_at: '2026-05-13T00:00:05.000Z',
+    });
+
+    const scan = await scanExternalCodexSessions();
+
+    expect(scan.candidates).toHaveLength(1000);
+    const ids = scan.candidates.map((candidate) => candidate.id);
+    expect(ids).toContain(oldestId);
+    expect(ids).not.toContain(`019dcd5a-6e54-7960-95e1-${String(1).padStart(12, '0')}`);
+    expect(
+      scan.candidates.find((candidate) => candidate.id === oldestId)?.updatedAt,
+    ).toBe(Date.parse('2026-05-13T00:00:05.000Z'));
+  }, 20_000);
+
   it('does not implicitly remove imported Codex rows during read-only scan', async () => {
     const dbPath = createStateDb(externalHome);
     const rolloutPath = path.join(externalHome, 'sessions', `rollout-2026-05-13-${threadId}.jsonl`);

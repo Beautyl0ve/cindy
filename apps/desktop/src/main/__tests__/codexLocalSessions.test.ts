@@ -461,7 +461,7 @@ describe('Codex local session import', () => {
     expect(row.title).toBe('Compatible custom title');
   });
 
-  it('keeps the state title for malformed, unmatched, or blank index entries', async () => {
+  it('keeps the state title but applies time for malformed, unmatched, or blank index entries', async () => {
     const dbPath = createStateDb(externalHome);
     const rolloutPath = path.join(
       externalHome,
@@ -492,14 +492,17 @@ describe('Codex local session import', () => {
       ].join('\n'),
     );
 
+    const indexUpdatedAt = Date.parse('2026-05-13T00:00:05.000Z');
     const scan = await scanExternalCodexSessions();
-    expect(scan.candidates).toMatchObject([{ id: threadId, title: 'State title' }]);
+    expect(scan.candidates).toMatchObject([
+      { id: threadId, title: 'State title', updatedAt: indexUpdatedAt },
+    ]);
 
     await importExternalCodexSessions([threadId]);
     const row = currentTestDb()
-      .prepare('SELECT title FROM sessions WHERE id = ?')
-      .get(`codex-${threadId}`) as { title: string };
-    expect(row.title).toBe('State title');
+      .prepare('SELECT title, updated_at AS updatedAt FROM sessions WHERE id = ?')
+      .get(`codex-${threadId}`) as { title: string; updatedAt: number };
+    expect(row).toEqual({ title: 'State title', updatedAt: indexUpdatedAt });
   });
 
   it('updates an imported title when a later Codex rename advances the index time', async () => {

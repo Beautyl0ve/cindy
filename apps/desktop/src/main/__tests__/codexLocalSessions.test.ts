@@ -249,6 +249,13 @@ function rolloutLineWithImage(id: string, text: string, timestamp: string): stri
   });
 }
 
+function writeSessionIndex(...entries: unknown[]): void {
+  fs.writeFileSync(
+    path.join(externalHome, 'session_index.jsonl'),
+    `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`,
+  );
+}
+
 beforeEach(() => {
   originalCodexHome = process.env.CODEX_HOME;
   rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-local-sessions-'));
@@ -390,6 +397,189 @@ describe('Codex local session import', () => {
     expect(result).toMatchObject({ scanned: 1, inserted: 1, updated: 0 });
     const rows = currentTestDb().prepare('SELECT id, title FROM sessions ORDER BY id').all();
     expect(rows).toEqual([{ id: `codex-${threadId}`, title: 'Import Me' }]);
+  });
+
+  it('imports a user-renamed Codex title from the session index', async () => {
+    const dbPath = createStateDb(externalHome);
+    const rolloutPath = path.join(
+      externalHome,
+      'sessions',
+      `rollout-2026-05-13-${threadId}.jsonl`,
+    );
+    fs.mkdirSync(path.dirname(rolloutPath), { recursive: true });
+    fs.writeFileSync(rolloutPath, '');
+    insertThread(dbPath, threadId, rolloutPath, {
+      updatedAt: 2_000,
+      title: 'Generated Codex title',
+    });
+    writeSessionIndex({
+      id: threadId,
+      thread_name: 'Fix login timeout',
+      updated_at: '2026-05-13T00:00:03.000Z',
+    });
+
+    const scan = await scanExternalCodexSessions();
+    expect(scan.candidates).toMatchObject([
+      { id: threadId, title: 'Fix login timeout' },
+    ]);
+
+    const result = await importExternalCodexSessions([threadId]);
+    expect(result).toMatchObject({ scanned: 1, inserted: 1, updated: 0 });
+    const rows = currentTestDb().prepare('SELECT id, title FROM sessions').all();
+    expect(rows).toEqual([{ id: `codex-${threadId}`, title: 'Fix login timeout' }]);
+  });
+
+  it('falls back to the session index title compatibility field', async () => {
+    const dbPath = createStateDb(externalHome);
+    const rolloutPath = path.join(
+      externalHome,
+      'sessions',
+      `rollout-2026-05-13-${threadId}.jsonl`,
+    );
+    fs.mkdirSync(path.dirname(rolloutPath), { recursive: true });
+    fs.writeFileSync(rolloutPath, '');
+    insertThread(dbPath, threadId, rolloutPath, {
+      updatedAt: 2_000,
+      title: 'Generated Codex title',
+    });
+    writeSessionIndex({
+      id: threadId,
+      thread_name: '   ',
+      title: 'Compatible custom title',
+      updated_at: '2026-05-13T00:00:03.000Z',
+    });
+
+    const scan = await scanExternalCodexSessions();
+    expect(scan.candidates).toMatchObject([
+      { id: threadId, title: 'Compatible custom title' },
+    ]);
+
+    await importExternalCodexSessions([threadId]);
+    const row = currentTestDb()
+      .prepare('SELECT title FROM sessions WHERE id = ?')
+      .get(`codex-${threadId}`) as { title: string };
+    expect(row.title).toBe('Compatible custom title');
+  });
+
+  it('keeps the state title for malformed, unmatched, or blank index entries', async () => {
+    const dbPath = createStateDb(externalHome);
+    const rolloutPath = path.join(
+      externalHome,
+      'sessions',
+      `rollout-2026-05-13-${threadId}.jsonl`,
+    );
+    fs.mkdirSync(path.dirname(rolloutPath), { recursive: true });
+    fs.writeFileSync(rolloutPath, '');
+    insertThread(dbPath, threadId, rolloutPath, {
+      updatedAt: 2_000,
+      title: 'State title',
+    });
+    fs.writeFileSync(
+      path.join(externalHome, 'session_index.jsonl'),
+      [
+        '{malformed',
+        JSON.stringify({
+          id: execThreadId,
+          thread_name: 'Different thread title',
+          updated_at: '2026-05-13T00:00:04.000Z',
+        }),
+        JSON.stringify({
+          id: threadId,
+          thread_name: '   ',
+          title: '',
+          updated_at: '2026-05-13T00:00:05.000Z',
+        }),
+      ].join('\n'),
+    );
+
+    const scan = await scanExternalCodexSessions();
+    expect(scan.candidates).toMatchObject([{ id: threadId, title: 'State title' }]);
+
+    await importExternalCodexSessions([threadId]);
+    const row = currentTestDb()
+      .prepare('SELECT title FROM sessions WHERE id = ?')
+      .get(`codex-${threadId}`) as { title: string };
+    expect(row.title).toBe('State title');
+  });
+
+  it('updates an imported title when a later Codex rename advances the index time', async () => {
+    const dbPath = createStateDb(externalHome);
+    const rolloutPath = path.join(
+      externalHome,
+      'sessions',
+      `rollout-2026-05-13-${threadId}.jsonl`,
+    );
+    fs.mkdirSync(path.dirname(rolloutPath), { recursive: true });
+    fs.writeFileSync(rolloutPath, '');
+    insertThread(dbPath, threadId, rolloutPath, {
+      updatedAt: 2_000,
+      title: 'Generated Codex title',
+    });
+    writeSessionIndex({
+      id: threadId,
+      thread_name: 'First custom title',
+      updated_at: '2026-05-13T00:00:03.000Z',
+    });
+
+    await importExternalCodexSessions([threadId]);
+    writeSessionIndex({
+      id: threadId,
+      thread_name: 'Renamed custom title',
+      updated_at: '2026-05-13T00:00:04.000Z',
+    });
+    const result = await importExternalCodexSessions([threadId]);
+
+    expect(result).toMatchObject({ scanned: 1, inserted: 0, updated: 1 });
+    const row = currentTestDb()
+      .prepare('SELECT title, updated_at AS updatedAt FROM sessions WHERE id = ?')
+      .get(`codex-${threadId}`) as { title: string; updatedAt: number };
+    expect(row).toEqual({
+      title: 'Renamed custom title',
+      updatedAt: Date.parse('2026-05-13T00:00:04.000Z'),
+    });
+  });
+
+  it('keeps the index title when the same thread is read from DB and rollout', async () => {
+    const dbPath = createStateDb(externalHome);
+    const rolloutPath = path.join(
+      externalHome,
+      'sessions',
+      `rollout-2026-05-13-${threadId}.jsonl`,
+    );
+    fs.mkdirSync(path.dirname(rolloutPath), { recursive: true });
+    fs.writeFileSync(
+      rolloutPath,
+      `${JSON.stringify({
+        timestamp: '2026-05-13T00:00:02.000Z',
+        type: 'session_meta',
+        payload: {
+          id: threadId,
+          timestamp: '2026-05-13T00:00:02.000Z',
+          cwd: '/tmp/project',
+          source: 'cli',
+          model: 'gpt-5.5',
+          reasoning_effort: 'high',
+          approval_mode: 'on-request',
+        },
+      })}\n`,
+    );
+    insertThread(dbPath, threadId, rolloutPath, {
+      updatedAt: 2_000,
+      title: 'Generated Codex title',
+    });
+    writeSessionIndex({
+      id: threadId,
+      thread_name: 'Authoritative index title',
+      updated_at: '2026-05-13T00:00:03.000Z',
+    });
+
+    const scan = await scanExternalCodexSessions();
+
+    expect(scan.candidates).toHaveLength(1);
+    expect(scan.candidates[0]).toMatchObject({
+      id: threadId,
+      title: 'Authoritative index title',
+    });
   });
 
   it('restores a soft-deleted imported Codex session without creating a duplicate', async () => {

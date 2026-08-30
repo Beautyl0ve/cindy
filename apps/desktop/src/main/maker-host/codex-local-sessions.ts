@@ -3778,6 +3778,7 @@ function readThreads(
 ): CodexThreadReadResult | null {
   let db: Database.Database | null = null;
   try {
+    const index = readSessionIndex(home);
     db = openReadonlyDb(dbPath);
     if (!tableExists(db, 'threads')) return null;
     const orderSql = buildThreadOrderSql(db);
@@ -3794,7 +3795,13 @@ function readThreads(
         continue;
       }
       if (threads.length >= MAX_THREADS_PER_HOME) continue;
-      const thread = normalizeThreadRow(home, dbPath, row, projectlessThreadIds);
+      const threadId = stringValue(row.id);
+      const thread = normalizeThreadRow(
+        home,
+        dbPath,
+        mergeThreadRowWithSessionIndex(row, index.get(threadId)),
+        projectlessThreadIds,
+      );
       if (thread) threads.push(thread);
     }
     return { threads, rejectedThreadIds: [...rejectedThreadIds] };
@@ -3858,7 +3865,7 @@ function readSessionIndex(home: string): Map<string, CodexSessionIndexEntry> {
       const id = stringValue(obj.id);
       if (!isLikelyThreadId(id)) continue;
       out.set(id, {
-        title: firstNonEmpty(stringValue(obj.thread_name), stringValue(obj.title), 'Codex Session'),
+        title: stringValue(obj.thread_name).trim() || stringValue(obj.title).trim(),
         updatedAt: timestampFromAny(obj.updated_at),
       });
     }
@@ -3869,6 +3876,25 @@ function readSessionIndex(home: string): Map<string, CodexSessionIndexEntry> {
     });
   }
   return out;
+}
+
+/** Overlay the user-owned Codex index metadata without discarding DB/rollout state. */
+function mergeThreadRowWithSessionIndex(
+  row: SqlRow,
+  entry: CodexSessionIndexEntry | undefined,
+): SqlRow {
+  const title = entry?.title.trim() ?? '';
+  if (!title) return row;
+
+  const rowUpdatedAt = timestampMs(row.updated_at_ms, row.updated_at);
+  const indexUpdatedAt = entry?.updatedAt ?? null;
+  return {
+    ...row,
+    title,
+    ...(indexUpdatedAt && (!rowUpdatedAt || indexUpdatedAt > rowUpdatedAt)
+      ? { updated_at_ms: indexUpdatedAt }
+      : {}),
+  };
 }
 
 function readProjectlessThreadIds(home: string): Set<string> {
@@ -4022,21 +4048,24 @@ function rolloutThreadRowFromFirstLine(
   const payload = obj.payload;
   const threadId = stringValue(payload.id) || threadIdFromRolloutPath(file);
   if (!isLikelyThreadId(threadId)) return null;
-  return {
-    id: threadId,
-    rollout_path: file,
-    created_at: stringValue(payload.timestamp) || stringValue(obj.timestamp),
-    updated_at: index.get(threadId)?.updatedAt ?? fallbackMtime ?? safeStatMtime(file),
-    source: stringValue(payload.source),
-    originator: stringValue(payload.originator),
-    thread_source: stringValue(payload.thread_source),
-    cwd: stringValue(payload.cwd),
-    title: index.get(threadId)?.title ?? '',
-    model: stringValue(payload.model),
-    reasoning_effort: stringValue(payload.reasoning_effort),
-    approval_mode: stringValue(payload.approval_mode),
-    archived: isArchivedRolloutPath(file) ? 1 : 0,
-  };
+  return mergeThreadRowWithSessionIndex(
+    {
+      id: threadId,
+      rollout_path: file,
+      created_at: stringValue(payload.timestamp) || stringValue(obj.timestamp),
+      updated_at: fallbackMtime ?? safeStatMtime(file),
+      source: stringValue(payload.source),
+      originator: stringValue(payload.originator),
+      thread_source: stringValue(payload.thread_source),
+      cwd: stringValue(payload.cwd),
+      title: '',
+      model: stringValue(payload.model),
+      reasoning_effort: stringValue(payload.reasoning_effort),
+      approval_mode: stringValue(payload.approval_mode),
+      archived: isArchivedRolloutPath(file) ? 1 : 0,
+    },
+    index.get(threadId),
+  );
 }
 
 function readFirstLineSync(file: string): string | null {
@@ -4627,23 +4656,38 @@ function assertExternalEmptyObservationsUnchanged(
 function findThreadByIdInHome(home: string, threadId: string): CodexThreadSummary | null {
   const dbPath = findLatestStateDb(home);
   const projectlessThreadIds = readProjectlessThreadIds(home);
-  if (!dbPath) return findExternalThreadByIdFromRollouts(home, threadId);
+  const index = readSessionIndex(home);
+  if (!dbPath) return findExternalThreadByIdFromRollouts(home, threadId, index);
   let db: Database.Database | null = null;
   try {
     db = openReadonlyDb(dbPath);
-    if (!tableExists(db, 'threads')) return findExternalThreadByIdFromRollouts(home, threadId);
+    if (!tableExists(db, 'threads')) {
+      return findExternalThreadByIdFromRollouts(home, threadId, index);
+    }
     const row = db.prepare('SELECT * FROM threads WHERE id = ? LIMIT 1').get(threadId) as SqlRow | undefined;
-    if (!row || !isTopLevelThreadRow(row)) return findExternalThreadByIdFromRollouts(home, threadId);
-    return normalizeThreadRow(home, dbPath, row, projectlessThreadIds) ?? findExternalThreadByIdFromRollouts(home, threadId);
+    if (!row || !isTopLevelThreadRow(row)) {
+      return findExternalThreadByIdFromRollouts(home, threadId, index);
+    }
+    return (
+      normalizeThreadRow(
+        home,
+        dbPath,
+        mergeThreadRowWithSessionIndex(row, index.get(threadId)),
+        projectlessThreadIds,
+      ) ?? findExternalThreadByIdFromRollouts(home, threadId, index)
+    );
   } catch {
-    return findExternalThreadByIdFromRollouts(home, threadId);
+    return findExternalThreadByIdFromRollouts(home, threadId, index);
   } finally {
     closeDbQuietly(db);
   }
 }
 
-function findExternalThreadByIdFromRollouts(home: string, threadId: string): CodexThreadSummary | null {
-  const index = readSessionIndex(home);
+function findExternalThreadByIdFromRollouts(
+  home: string,
+  threadId: string,
+  index: Map<string, CodexSessionIndexEntry> = readSessionIndex(home),
+): CodexThreadSummary | null {
   const projectlessThreadIds = readProjectlessThreadIds(home);
   const file = collectRolloutFiles(home).find((candidate) => threadIdFromRolloutPath(candidate) === threadId);
   if (!file) return null;

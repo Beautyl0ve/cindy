@@ -3884,13 +3884,11 @@ function mergeThreadRowWithSessionIndex(
   entry: CodexSessionIndexEntry | undefined,
 ): SqlRow {
   const title = entry?.title.trim() ?? '';
-  if (!title) return row;
-
   const rowUpdatedAt = timestampMs(row.updated_at_ms, row.updated_at);
   const indexUpdatedAt = entry?.updatedAt ?? null;
   return {
     ...row,
-    title,
+    ...(title ? { title } : {}),
     ...(indexUpdatedAt && (!rowUpdatedAt || indexUpdatedAt > rowUpdatedAt)
       ? { updated_at_ms: indexUpdatedAt }
       : {}),

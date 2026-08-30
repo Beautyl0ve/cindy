@@ -17,10 +17,14 @@
  *   6. 用户按 Send:
  *        a. vendorAuthGate.checkAndConfirm(vendor)
  *           - 未就绪 → 弹通用 confirmDialog → 跳 settings → 中止
- *        b. 普通路径: createSession → setPending → navigate → SessionView 自动发送
+ *        b. 本机普通路径: createSession → sendMessage → navigate。首条消息在草稿
+ *           路由发出,不把发送绑在 SessionView hydrate 上;切走只换画面。
+ *           SessionView 会当成斜杠命令的首条(列首 /cmd,以及 Pi 空白前缀)仍 setPending。
  *        c. Worktree 路径: 先 createSession + 插入状态卡 + navigate,再后台
  *           createWorktree；成功后更新 workingDir 并发送首条消息，失败则把原消息
  *           存回该 session 的 composer draft 供用户重试
+ *        d. device-link 远程路径仍走 setPending → SessionView 消费(对端开协同
+ *           可能要等隧道,不能挡在 navigate 前面)
  *
  * 文本/附件持久化:
  *   - vendor / workingDir / lastByVendor → localStorage 跨重启保留
@@ -124,6 +128,7 @@ import {
   getDraft as getComposerDraft,
   plainTextToTiptapDoc,
   quickStartTextToTiptapDoc,
+  restoreRemoteOptimisticDraft,
   saveDraft as saveComposerDraft,
 } from '@/lib/composerDraftStore';
 import type { JSONContent } from '@tiptap/core';
@@ -144,6 +149,7 @@ import { cleanupStagedChatAttachmentFiles } from '@/lib/chatAttachmentStageClean
 import type { GoalLimitValues } from '@/components/new-chat/GoalAdvancedLimits';
 import { makerChatStore } from '@/lib/makerChatStore';
 import {
+  leadingSlashInvocation,
   rebaseInlineRangesAfterSlashCommandRewrite,
   rewritePiSkillMessageForSend,
 } from '@/lib/slashCommands';
@@ -568,6 +574,41 @@ async function rehomeDraftAttachments(
   return rehomed;
 }
 
+async function rehomeDraftBrowserComments<T extends { screenshot: AttachedFile }>(
+  comments: T[] | undefined,
+  sessionId: string,
+): Promise<T[] | undefined> {
+  if (!comments || comments.length === 0) return comments;
+  return Promise.all(
+    comments.map(async (comment) => {
+      const rehomed = await rehomeDraftAttachments([comment.screenshot], sessionId);
+      return rehomed?.[0] ? { ...comment, screenshot: rehomed[0] } : comment;
+    }),
+  );
+}
+
+function rewriteBrowserCommentsFromRehomedFiles<T extends { screenshot: AttachedFile }>(
+  comments: T[] | undefined,
+  rehomedFiles: AttachedFile[] | undefined,
+): T[] {
+  if (!comments?.length) return comments ?? [];
+  const byId = new Map((rehomedFiles ?? []).map((file) => [file.id, file]));
+  return comments.map((comment) => {
+    const screenshot = byId.get(comment.screenshot.id);
+    return screenshot ? { ...comment, screenshot } : comment;
+  });
+}
+
+function excludeCommentScreenshots(
+  files: AttachedFile[] | undefined,
+  comments: readonly { screenshot: AttachedFile }[],
+): AttachedFile[] {
+  if (!files?.length) return files ?? [];
+  if (comments.length === 0) return files;
+  const commentIds = new Set(comments.map((comment) => comment.screenshot.id));
+  return files.filter((file) => !commentIds.has(file.id));
+}
+
 function getCurrentRoutePath(): string {
   const raw =
     window.location.hash.startsWith('#') && window.location.hash.length > 1
@@ -628,6 +669,9 @@ export function NewMakerDraftRoute() {
   const handledDialogueTargetRequestRef = useRef<string | null>(null);
   const modePickerSelectionSeqRef = useRef(0);
   const handledFolderPickerRequestRef = useRef<string | null>(null);
+  // Writable picker evidence is Main-owned and bound to the actual local task id.
+  // Reserve that id for the lifetime of this draft instead of generating it after selection.
+  const localDraftSessionIdRef = useRef(makeDraftSessionId());
   // 首参 914=内容封顶宽(→ inputWidth 封顶 934):大屏留出左右呼吸空间,不再顶满全宽;
   // 与进行中对话页(CCAgentSessionView 同传 914)一致,发送首条消息时输入框宽度不跳变。
   // minWidth=640:小屏兜一个体面下限(与对话页对称);窄于下限时 hook 自动回落成
@@ -1061,6 +1105,7 @@ export function NewMakerDraftRoute() {
   const providerOnboarding = useProviderOnboarding();
   const showProviderOnboardingCard = providerOnboarding.visible && !isDeviceLinkDraft;
   const effectiveExtraDirs = draft.extraDirs;
+  const effectiveWritableDirs = draft.writableDirs;
   const effectiveCollab = collab;
   // 协同入口判定与会话视图共用同一个 helper(issue #1170:两处各写一份判据,于是同一个
   // device-link 项目在草稿里没入口、进会话页又有)。草稿的 workspaceKind 显式按
@@ -2281,7 +2326,7 @@ export function NewMakerDraftRoute() {
         remoteHostId: null,
         // 换设备 → 上一台的路径全失效;进「对话」→ 单次授权不该跨上下文延续。
         // 同机换项目时不传(store 保持原值):那些目录在这台机器上仍然有效。
-        ...(deviceChanged || req.workingDir == null ? { extraDirs: [] } : {}),
+        ...(deviceChanged || req.workingDir == null ? { extraDirs: [], writableDirs: [] } : {}),
       });
     },
     [
@@ -2458,6 +2503,7 @@ export function NewMakerDraftRoute() {
           remoteHostId: target.hostId,
           providerId: sshProviderId,
           extraDirs: [],
+          writableDirs: [],
         });
         if (!newSession) {
           throw new Error('createSession returned null');
@@ -2469,6 +2515,7 @@ export function NewMakerDraftRoute() {
           agentKind: dbToMakerAgentKind(draftVendor),
           fastMode: sshFastMode,
           planModeEnabled: effectivePlanMode,
+          remoteHostId: target.hostId,
         });
         // 把草稿页已输入的文本/附件移交到新会话,避免 navigate 后丢失。
         // rehomeDraftAttachments 把 base64 和 xdt-image://__new_maker_draft__/ 迁移到
@@ -2483,15 +2530,10 @@ export function NewMakerDraftRoute() {
             existingDraft.attachments.filter((attachment) => attachment.category !== 'image'),
           );
           const rehomedAttachments = await rehomeDraftAttachments(imageOnly, newSession.id);
-          let rehomedComments = existingDraft.browserComments;
-          if (rehomedComments && rehomedComments.length > 0) {
-            rehomedComments = await Promise.all(
-              rehomedComments.map(async (c) => {
-                const rehomed = await rehomeDraftAttachments([c.screenshot], newSession.id);
-                return rehomed?.[0] ? { ...c, screenshot: rehomed[0] } : c;
-              }),
-            );
-          }
+          const rehomedComments = await rehomeDraftBrowserComments(
+            existingDraft.browserComments,
+            newSession.id,
+          );
           // SSH 环境下本地 @file/@dir mention 无效,从 Tiptap 文档中剥离。
           const strippedText = existingDraft.text
             ? stripLocalMentionChips(existingDraft.text)
@@ -2909,7 +2951,9 @@ export function NewMakerDraftRoute() {
   // 也不跨重启还原,双保险。workingDir / 文本 / 模型等便利性记忆不受影响。
   // StrictMode 双 mount 安全:清空幂等;guard 避免空转 emit。
   useEffect(() => {
-    if (getDraft().extraDirs.length > 0) patchDraft({ extraDirs: [] });
+    if (getDraft().extraDirs.length > 0 || getDraft().writableDirs.length > 0) {
+      patchDraft({ extraDirs: [], writableDirs: [] });
+    }
   }, []);
 
   // ─── 用户增删 extraDirs → 写回 draft ────────────────────────────────────
@@ -2917,6 +2961,9 @@ export function NewMakerDraftRoute() {
   // 时一次性透传到 DB / agent 即可(sanitize 不跨重启还原,见 store 注释)。
   const handleExtraDirsChange = useCallback((next: string[]) => {
     patchDraft({ extraDirs: next });
+  }, []);
+  const handleWritableDirsChange = useCallback((next: string[]) => {
+    patchDraft({ writableDirs: next });
   }, []);
 
   const handleFolderPickerOpenChange = useCallback((open: boolean) => {
@@ -3665,6 +3712,7 @@ export function NewMakerDraftRoute() {
               id: presetSessionId,
               workingDir: remoteWorkingDir,
               extraDirs: effectiveExtraDirs,
+              writableDirs: effectiveWritableDirs,
               // 候选值 = ChatInput 回传的实时值(用户此刻在界面上看到的那一组)。来源校准与 args
               // 组装都在 resolveDeviceLinkSubmission 里,与「新建目标」共用同一份规则 —— 那两条
               // 路径各自推导曾长出过只在其中一条上复现的缺陷(见该函数注释)。
@@ -3829,7 +3877,7 @@ export function NewMakerDraftRoute() {
           // Send 流程会先 createSession (本段下方) 创建 Lead,然后立刻调 enableOrca
           // 拉起 Worker (见下方 "F-COLLAB: draft 阶段开了协同模式" 段)。
 
-          const sessionId = makeDraftSessionId();
+          const sessionId = localDraftSessionIdRef.current;
           const optimisticTitle = optimisticFirstMessageTitle(
             message,
             files,
@@ -3867,6 +3915,7 @@ export function NewMakerDraftRoute() {
               workingDir: baseRepo,
               workspaceKind: 'project',
               extraDirs: effectiveExtraDirs,
+              writableDirs: effectiveWritableDirs,
               remoteHostId: effectiveRemoteHostId ?? undefined,
               providerId,
             });
@@ -3896,6 +3945,7 @@ export function NewMakerDraftRoute() {
               agentKind: persistedAgentKind === 'cc' ? 'claude-code' : persistedAgentKind,
               fastMode: effectiveFastMode,
               planModeEnabled: effectivePlanMode,
+              remoteHostId: effectiveRemoteHostId ?? null,
             });
             worktreeCreationStore.set(newSession.id, {
               status: 'creating',
@@ -3908,7 +3958,9 @@ export function NewMakerDraftRoute() {
             // 不会暴露 cleared 后的视觉状态。clearFiles 仍然在 React 提交 unmount cleanup
             // 之前同步执行,所以 useAttachments 的 cleanup 不会把刚送出去的附件回写到 store。
             // 保存原始 doc JSON(含 quickStartPill 等 mark),供 worktree 失败恢复时原样还原。
-            const preNavDraftDoc = getComposerDraft(NEW_MAKER_DRAFT_KEY)?.text ?? null;
+            const preNavDraft = getComposerDraft(NEW_MAKER_DRAFT_KEY);
+            const preNavDraftDoc = preNavDraft?.text ?? null;
+            const preNavBrowserComments = preNavDraft?.browserComments ?? [];
             navigate(`/cc-agent/${newSession.id}`, { replace: true });
             // clearDraftAndNotify (not bare clear): onSend returned false above
             // so ChatInput never cleared its editor — without notifying it, the
@@ -3924,10 +3976,12 @@ export function NewMakerDraftRoute() {
               // 真实会话消息(删会话清不到)。初始值取原 files:rehome 自身抛错时
               // 走 catch 恢复原附件,行为与迁移前一致(fail-soft)。
               let rehomedFiles = files;
+              let rehomedComments = preNavBrowserComments;
               const restoreFirstMessageDraft = () => {
                 saveComposerDraft(newSession.id, {
                   text: preNavDraftDoc ?? plainTextToTiptapDoc(message),
-                  attachments: rehomedFiles ?? [],
+                  attachments: excludeCommentScreenshots(rehomedFiles, rehomedComments),
+                  browserComments: rehomedComments,
                 });
                 // 第一条消息退回草稿 = 它没被交出去,也就永远不会有权威标题回流。
                 // 不撤回的话标题预览会一直盖着 DB 里的哨兵(每次全量刷新后重新盖上),
@@ -3939,6 +3993,10 @@ export function NewMakerDraftRoute() {
               };
               try {
                 rehomedFiles = await rehomeDraftAttachments(files, newSession.id);
+                rehomedComments = rewriteBrowserCommentsFromRehomedFiles(
+                  preNavBrowserComments,
+                  rehomedFiles,
+                );
                 const resp = await window.electronAPI.worktreeCreate({
                   sessionId: newSession.id,
                   baseRepo,
@@ -4117,6 +4175,7 @@ export function NewMakerDraftRoute() {
             remoteHostId: workingDir ? (effectiveRemoteHostId ?? undefined) : undefined,
             // extraDirs 是 vendor 无关字段；Claude 与 Codex 都按只读引用目录透传。
             extraDirs: effectiveExtraDirs,
+            writableDirs: effectiveWritableDirs,
             providerId,
           });
           if (!newSession) {
@@ -4128,14 +4187,15 @@ export function NewMakerDraftRoute() {
           carryDraftFavoriteAnchorToSession(newSession.id, persistedAgentKind, model, providerId);
           // 计划模式是一次性选择:随本次发送被消耗,草稿勾选同步熄灭。
           if (effectivePlanMode) patchActivePrefs({ planMode: false });
-          // 首条消息经 setPending → SessionView 自动发送,createOpts 读 chat store 的
-          // planModeEnabled —— ensureInitialMessages 的行水合是异步的,必须先确定性
-          // seed store,否则勾了计划模式的首条消息可能以 planMode:false 发出
-          // (worktree 路径同款 seed;bot review P2)。
+          // 本机/SSH 首条在下面直接 sendMessage,createOpts 读 chat store 的
+          // planModeEnabled / remoteHostId —— ensureInitialMessages 的行水合是异步的,
+          // 必须先确定性 seed store,否则勾了计划模式的首条可能以 planMode:false 发出,
+          // SSH 首条会把远端路径当本机 workdir(worktree 路径同款 seed)。
           makerChatStore.setSessionRuntime(newSession.id, {
             agentKind: capabilityAgentKind,
             fastMode: effectiveFastMode,
             planModeEnabled: effectivePlanMode,
+            remoteHostId: workingDir ? (effectiveRemoteHostId ?? null) : null,
           });
 
           // "创建即发送"路径:乐观回写 userSendAt 跳过 projectGrouping 的草稿兜底
@@ -4184,38 +4244,150 @@ export function NewMakerDraftRoute() {
           }
 
           // 草稿态 base64 图片回填到新 session 的 image cache,换成 xdt-image://
-          // URL。必须在 setPending 之前,否则 SessionView 拿到的还是 base64。
+          // URL。必须在发出首条之前,否则消息里还是草稿命名空间。
           const rehydratedFiles = await rehomeDraftAttachments(files, newSession.id);
-          setPending(newSession.id, {
-            text: message,
-            files: rehydratedFiles,
-            mentions,
-            ...(opts?.quotesEncoded ? { quotesEncoded: true } : {}),
-            ...(opts?.agentReferences?.length ? { agentReferences: opts.agentReferences } : {}),
-            ...(opts?.pastedTextRanges?.length ? { pastedTextRanges: opts.pastedTextRanges } : {}),
-            ...(opts?.slashCommandRanges !== undefined
-              ? { slashCommandRanges: opts.slashCommandRanges }
-              : {}),
-            ...(deferredUiAssignment ? { deferredUiAssignment } : {}),
-          });
-          opts?.onAccepted?.();
-          // 草稿已经成功移交给新会话(setPending),清掉 NEW_MAKER_DRAFT_KEY
-          // 下的 store 条目,防止下次回到 /cc-agent/new 还看到本次刚发送的内容。
-          // 用 clearDraftAndNotify:上面 onSend return false,ChatInput 没清自己的
-          // 编辑器,这里必须通知它同步清空,否则 navigate 卸载时 ChatInput 的兜底
-          // effect 会把残留文本又写回 NEW_MAKER_DRAFT_KEY,撤销这次 clear。
-          clearComposerDraftAndNotify(NEW_MAKER_DRAFT_KEY);
-          // 同步清空 attachmentsRef,否则 navigate 触发 unmount 时
-          // useAttachments 的 cleanup effect 会把旧附件重新写回 store。
-          attachmentState.clearFiles();
-          resetDraftWorkspaceAfterSend();
-          // 让 SessionView 接管:它 mount 时 consumePending 自动发送首条。
-          navigate(orcaNavTarget ?? `/cc-agent/${newSession.id}`, {
-            replace: true,
-            state: orcaWorkersRevealState
-              ? { orcaWorkersReveal: orcaWorkersRevealState }
-              : undefined,
-          });
+          const sendWorkingDir = workingDir ?? newSession.workingDir;
+          const preNavDraft = getComposerDraft(NEW_MAKER_DRAFT_KEY);
+          const preNavDraftDoc = preNavDraft?.text ?? null;
+          const preNavBrowserComments = rewriteBrowserCommentsFromRehomedFiles(
+            preNavDraft?.browserComments,
+            rehydratedFiles,
+          );
+          const restoreFirstMessageDraft = () => {
+            // FIFO 插回失败的首条,不覆盖用户在等待期间已经写进新任务输入框的内容。
+            restoreRemoteOptimisticDraft(newSession.id, {
+              clientId: `local-first:${newSession.id}`,
+              text: preNavDraftDoc ?? plainTextToTiptapDoc(message),
+              attachments: excludeCommentScreenshots(rehydratedFiles, preNavBrowserComments),
+              browserComments: preNavBrowserComments,
+            });
+            emitAutoTitlePreviewCleared(newSession.id);
+            clearSessionStarting(newSession.id);
+          };
+          const navigateToSession = () => {
+            navigate(orcaNavTarget ?? `/cc-agent/${newSession.id}`, {
+              replace: true,
+              state: orcaWorkersRevealState
+                ? { orcaWorkersReveal: orcaWorkersRevealState }
+                : undefined,
+            });
+          };
+          const handOffDraftToSession = () => {
+            // 用 clearDraftAndNotify:上面 onSend return false,ChatInput 没清自己的
+            // 编辑器,这里必须通知它同步清空,否则 navigate 卸载时 ChatInput 的兜底
+            // effect 会把残留文本写回 NEW_MAKER_DRAFT_KEY,撤销这次 clear。
+            clearComposerDraftAndNotify(NEW_MAKER_DRAFT_KEY);
+            attachmentState.clearFiles();
+            resetDraftWorkspaceAfterSend();
+          };
+
+          // 本机首条消息在草稿路由发出,不把发送绑在 SessionView hydrate 上。
+          // sendMessage 同步推入 store 后再 navigate,切走只换画面、不撤发送。
+          if (!sendWorkingDir) {
+            log.error('[draft send] created session missing workingDir');
+            restoreFirstMessageDraft();
+            handOffDraftToSession();
+            navigateToSession();
+            return;
+          }
+
+          try {
+            // 斜杠命令必须走 SessionView 的完整分派(SSH skipAgentSkills、远端 /review
+            // 拒绝、Pi runtime 重试)。识别窗口与 maybeDispatchDesktopSlashCommand 相同:
+            // 列首 /cmd,以及 Pi 的空白前缀 /cmd;草稿路由只交接,不复制分派逻辑。
+            const slashMatch = message.match(/^\/(\S+)(?:\s+(.*))?$/s);
+            const leading =
+              !slashMatch && capabilityAgentKind === 'pi'
+                ? leadingSlashInvocation(message)
+                : undefined;
+            if (slashMatch || leading) {
+              setPending(newSession.id, {
+                text: message,
+                files: rehydratedFiles,
+                mentions,
+                ...(opts?.quotesEncoded ? { quotesEncoded: true } : {}),
+                ...(opts?.agentReferences?.length ? { agentReferences: opts.agentReferences } : {}),
+                ...(opts?.pastedTextRanges?.length
+                  ? { pastedTextRanges: opts.pastedTextRanges }
+                  : {}),
+                ...(opts?.slashCommandRanges !== undefined
+                  ? { slashCommandRanges: opts.slashCommandRanges }
+                  : {}),
+                ...(deferredUiAssignment ? { deferredUiAssignment } : {}),
+              });
+              handOffDraftToSession();
+              navigateToSession();
+              return;
+            }
+
+            const dispatchedMessage = await rewritePiSkillMessageForSend({
+              agentKind: capabilityAgentKind,
+              message,
+              workingDir: sendWorkingDir,
+              sessionId: newSession.id,
+            });
+            const rebaseRanges = <T extends { start: number; end: number }>(
+              ranges: readonly T[] | undefined,
+            ): T[] | undefined => {
+              if (!ranges) return undefined;
+              return rebaseInlineRangesAfterSlashCommandRewrite(
+                ranges,
+                message,
+                dispatchedMessage,
+              );
+            };
+            const sendPromise = makerChatStore.sendMessage(
+              newSession.id,
+              dispatchedMessage,
+              model,
+              effort,
+              permissionMode,
+              sendWorkingDir,
+              rehydratedFiles,
+              mentions,
+              {
+                ...(opts?.quotesEncoded ? { quotesEncoded: true } : {}),
+                ...(opts?.agentReferences?.length
+                  ? { agentReferences: rebaseRanges(opts.agentReferences) }
+                  : {}),
+                ...(opts?.pastedTextRanges?.length
+                  ? { pastedTextRanges: rebaseRanges(opts.pastedTextRanges) }
+                  : {}),
+                ...(opts?.slashCommandRanges !== undefined
+                  ? { slashCommandRanges: rebaseRanges(opts.slashCommandRanges) }
+                  : {}),
+              },
+            );
+            handOffDraftToSession();
+            navigateToSession();
+            void sendPromise.then(
+              (accepted) => {
+                if (accepted) {
+                  opts?.onAccepted?.();
+                  void dispatchDeferredUiAssignment(newSession.id, deferredUiAssignment).catch(
+                    (err) => {
+                      log.error('[draft send] deferred Worker assignment failed', err);
+                      toast.error(t('newChat.collaboration.assignmentFailed'));
+                    },
+                  );
+                } else {
+                  restoreFirstMessageDraft();
+                  if (deferredUiAssignment) {
+                    toast.error(t('newChat.collaboration.assignmentFailed'));
+                  }
+                }
+              },
+              (err) => {
+                log.error('[draft send]', err);
+                restoreFirstMessageDraft();
+              },
+            );
+          } catch (err) {
+            log.error('[draft send]', err);
+            restoreFirstMessageDraft();
+            handOffDraftToSession();
+            navigateToSession();
+          }
         } catch (err) {
           // 交接失败 → 撤回乐观标题预览(理由见上面 optimisticTitleSessionId 的注释)。
           // 归属切换也会提前 return,必须先撤;否则已建、未发出首条的空会话会一直顶着原文。
@@ -4509,6 +4681,7 @@ export function NewMakerDraftRoute() {
             id: presetSessionId,
             workingDir: remoteWorkingDir,
             extraDirs: effectiveExtraDirs,
+            writableDirs: effectiveWritableDirs,
             // 候选值 = 组件级派生值(弹窗独立于 ChatInput,拿不到它的回传)。与发送路径过同一道
             // 校准 —— 这两条路径曾各自推导,于是「只在新建目标上复现」的缺陷出过三次。
             candidate: {
@@ -4701,7 +4874,7 @@ export function NewMakerDraftRoute() {
           && selectedWorktree.enabled
           && selectedWorktree.confirmedIneligible !== true,
         );
-        goalSessionId = makeDraftSessionId();
+        goalSessionId = localDraftSessionIdRef.current;
         optimisticGoalTitle = normalizeAutoTitle(objective);
         if (optimisticGoalTitle) emitAutoTitlePreview(goalSessionId, optimisticGoalTitle);
         let goalWorkingDir = selectedWorkingDir;
@@ -4734,6 +4907,7 @@ export function NewMakerDraftRoute() {
           workspaceKind: goalWorkingDir ? 'project' : 'dialogue',
           remoteHostId: goalWorkingDir ? (effectiveRemoteHostId ?? undefined) : undefined,
           extraDirs: effectiveExtraDirs,
+          writableDirs: effectiveWritableDirs,
           providerId: chatInitialProviderId ?? null,
         });
         if (!newSession) {
@@ -5250,6 +5424,8 @@ export function NewMakerDraftRoute() {
                     // 「+」始终显示(与对话界面一致):无项目裸态也可加引用目录,作为本次对话的上下文。
                     // createSession 各路径都会带上 extraDirs;workingDir=null 时 ExtraDirsButton 跳过重叠校验。
                     extraDirs={effectiveExtraDirs}
+                    writableDirs={effectiveWritableDirs}
+                    writableGrantScope={localDraftSessionIdRef.current}
                     // 远程草稿不给引用目录入口(Codex review P1):ExtraDirsButton 开的是**控制端**
                     // 原生目录对话框,选出来的本机路径发到对端后要么被 validateExtraDirs 静默丢掉、
                     // 要么撞上对端同名的无关目录 —— 界面上那几个 chip 于是并不描述真实授予的上下文。
@@ -5257,6 +5433,11 @@ export function NewMakerDraftRoute() {
                     // Plugin 入口不受影响)。进入远程设备时 extraDirs 已被清空,不会留下无法删除的残留。
                     // 恢复这个能力要把 picker 路由到对端(设备域浏览器已有 fs:list-dir),见 follow-up。
                     onExtraDirsChange={isDeviceLinkDraft ? undefined : handleExtraDirsChange}
+                    onWritableDirsChange={
+                      isDeviceLinkDraft || isRemoteProjectDraft
+                        ? undefined
+                        : handleWritableDirsChange
+                    }
                     // 首页「新建目标」入口:草稿态没有 sessionId,由本组件 createSession→setGoal。
                     // ChatInput 把输入框当前文字传上来作默认目标内容。
                     onNewGoal={(text) => {

@@ -21,6 +21,7 @@ interface RuntimeSetModelSession {
   remoteHostId?: string | null;
   codexProxyActive?: boolean | null;
   codexThreadModelProviderId?: string | null;
+  codexCindyRemoteCompactionCompatible?: boolean | null;
   model: string;
   setModel: (model: string, opts?: { providerId?: string | null; effort?: Effort }) => Promise<void>;
 }
@@ -97,6 +98,13 @@ export interface ApplyRuntimeSetModelChangeInput {
    * exact interaction boundary that still needs to be approved.
    */
   requireHotSwitch?: boolean;
+  /**
+   * The host has proved that this local Codex selection crosses the explicit XD/OpenAI
+   * credential boundary and has a persisted native thread to rebuild.
+   */
+  requiresCodexThreadRelink?: boolean;
+  /** Closes over the captured Profile DB and atomically commits thread + full target route. */
+  relinkCodexThread?: () => Promise<void>;
   logger?: RuntimeSetModelLogger;
 }
 
@@ -109,9 +117,9 @@ export class RuntimeSetModelHotSwitchRequiredError extends Error {
 
 export type ApplyRuntimeSetModelChangeResult =
   /** 直接生效(热切 route / 或已关会话待下次发送重建)。 */
-  | { status: 'applied' }
+  | { status: 'applied'; persistedRoute?: true }
   /** 凭证形态要换但会话自己在跑:已登记 pending,turn 结束后自动生效。 */
-  | { status: 'deferred' };
+  | { status: 'deferred'; persistedRoute?: never };
 
 export function isRemoteModelSwitchRouteChangeError(error: unknown): boolean {
   return (
@@ -166,9 +174,15 @@ export async function applyRuntimeSetModelChange(
         nextModel: model,
         currentCodexProxyActive: sess.codexProxyActive,
         currentCodexThreadModelProviderId: sess.codexThreadModelProviderId,
+        currentCodexCindyRemoteCompactionCompatible:
+          sess.codexCindyRemoteCompactionCompatible,
         codexAuthInjection: input.codexAuthInjection,
       })
     : false;
+  const requiresCodexThreadRelink = input.requiresCodexThreadRelink === true;
+  if (requiresCodexThreadRelink && !input.relinkCodexThread) {
+    throw new Error(`Codex provider thread relink is required for session ${sessionId}`);
+  }
   let selfBusyMemo: boolean | undefined;
   const isSelfBusy = (): boolean => {
     if (selfBusyMemo !== undefined) return selfBusyMemo;
@@ -200,12 +214,27 @@ export async function applyRuntimeSetModelChange(
       currentProviderId !== nextProviderId ||
       pendingTarget !== undefined ||
       shouldCloseSession ||
+      requiresCodexThreadRelink ||
       providerRouteWouldDefer
     ) {
       throw new RuntimeSetModelHotSwitchRequiredError(
         'Plan approval can only hot-switch models on the current provider and credential route',
       );
     }
+  }
+
+  if (requiresCodexThreadRelink && isSelfBusy()) {
+    throw new CredentialModeSwitchBusyError(
+      [sessionId],
+      `Cannot rebuild Codex provider thread while the session is busy: ${sessionId}`,
+    );
+  }
+
+  if (!sess && requiresCodexThreadRelink) {
+    await input.relinkCodexThread?.();
+    if (providerId !== undefined) setSessionProvider(sessionId, nextProviderId);
+    input.wakeSessionInputQueue?.(sessionId);
+    return { status: 'applied', persistedRoute: true };
   }
 
   if (providerRouteWouldDefer) {
@@ -234,7 +263,7 @@ export async function applyRuntimeSetModelChange(
     );
   }
 
-  if (sess && shouldCloseSession) {
+  if (sess && (shouldCloseSession || requiresCodexThreadRelink)) {
     if (isSelfBusy() && input.registerPendingCredentialSwitch) {
       await input.registerPendingCredentialSwitch(sessionId, {
         model,
@@ -268,7 +297,11 @@ export async function applyRuntimeSetModelChange(
     } catch (err) {
       // 空闲判定与 close 之间的竞态(恰好起了新 turn):有 pending 通道就转延迟,
       // 没有(老调用方)保持抛 busy 的旧语义。
-      if (isCredentialModeSwitchBusyError(err) && input.registerPendingCredentialSwitch) {
+      if (
+        !requiresCodexThreadRelink &&
+        isCredentialModeSwitchBusyError(err) &&
+        input.registerPendingCredentialSwitch
+      ) {
         input.registerPendingCredentialSwitch(sessionId, {
           model,
           providerId: nextProviderId,
@@ -285,6 +318,9 @@ export async function applyRuntimeSetModelChange(
       }
       throw err;
     }
+    if (requiresCodexThreadRelink) {
+      await input.relinkCodexThread?.();
+    }
     if (providerId !== undefined) setSessionProvider(sessionId, nextProviderId);
     // close + route 都落定后再唤醒队列:排队消息按新凭证形态 lazy-create 派发。
     input.wakeSessionInputQueue?.(sessionId);
@@ -296,7 +332,9 @@ export async function applyRuntimeSetModelChange(
       fromModel: sess.model,
       toModel: model,
     });
-    return { status: 'applied' };
+    return requiresCodexThreadRelink
+      ? { status: 'applied', persistedRoute: true }
+      : { status: 'applied' };
   }
 
   if (providerId !== undefined) {

@@ -972,8 +972,8 @@ describe('Codex local session import', () => {
   });
 
   it('caps to newest MAX_THREADS_PER_HOME top-level threads when more than 1000 exist', async () => {
-    // 写 1001 个有效 thread（updatedAt 递增），cap=1000 时应该保留 updatedAt 最新的 1000 个。
-    // 被剔除的应该是 updatedAt 最小那个（id=...000000000000）。
+    // 写 1001 个有效 thread（updatedAt 递增），再用 index 把最旧一条提升为最新。
+    // cap=1000 时应该先合并 index 时间，再剔除新的最旧一条。
     const dbPath = createStateDb(externalHome);
     const rolloutPath = path.join(externalHome, 'sessions', `rollout-2026-05-13-${threadId}.jsonl`);
     fs.mkdirSync(path.dirname(rolloutPath), { recursive: true });
@@ -983,12 +983,21 @@ describe('Codex local session import', () => {
       const id = `019dcd5a-6e54-7960-95e0-${String(i).padStart(12, '0')}`;
       insertThread(dbPath, id, rolloutPath, { updatedAt: 10_000 + i });
     }
+    writeSessionIndex({
+      id: oldestId,
+      thread_name: '   ',
+      updated_at: '2026-05-13T00:00:05.000Z',
+    });
 
     const scan = await scanExternalCodexSessions();
 
     expect(scan.candidates).toHaveLength(1000);
     const ids = scan.candidates.map((c) => c.id);
-    expect(ids).not.toContain(oldestId);
+    expect(ids).toContain(oldestId);
+    expect(ids).not.toContain(`019dcd5a-6e54-7960-95e0-${String(1).padStart(12, '0')}`);
+    expect(
+      scan.candidates.find((candidate) => candidate.id === oldestId)?.updatedAt,
+    ).toBe(Date.parse('2026-05-13T00:00:05.000Z'));
     // 抽样：最新一条（updatedAt=11000）应当在结果里
     expect(ids).toContain(`019dcd5a-6e54-7960-95e0-${String(1000).padStart(12, '0')}`);
   }, 15_000);

@@ -3787,19 +3787,30 @@ function readThreads(
       FROM threads
       ${orderSql}
     `).all() as SqlRow[];
+    const indexedRows = rows.map((row, originalIndex) => {
+      const threadId = stringValue(row.id);
+      return {
+        row: mergeThreadRowWithSessionIndex(row, index.get(threadId)),
+        originalIndex,
+      };
+    });
+    indexedRows.sort((left, right) => {
+      const byUpdatedAt =
+        threadRowOrderTimestamp(right.row) - threadRowOrderTimestamp(left.row);
+      return byUpdatedAt || left.originalIndex - right.originalIndex;
+    });
     const threads: CodexThreadSummary[] = [];
     const rejectedThreadIds = new Set<string>();
-    for (const row of rows) {
+    for (const { row } of indexedRows) {
       if (!isTopLevelThreadRow(row)) {
         addRejectedThreadId(row, rejectedThreadIds);
         continue;
       }
       if (threads.length >= MAX_THREADS_PER_HOME) continue;
-      const threadId = stringValue(row.id);
       const thread = normalizeThreadRow(
         home,
         dbPath,
-        mergeThreadRowWithSessionIndex(row, index.get(threadId)),
+        row,
         projectlessThreadIds,
       );
       if (thread) threads.push(thread);
@@ -3895,6 +3906,12 @@ function mergeThreadRowWithSessionIndex(
       ? { updated_at_ms: indexUpdatedAt }
       : {}),
   };
+}
+
+function threadRowOrderTimestamp(row: SqlRow): number {
+  return timestampMs(row.updated_at_ms, row.updated_at)
+    ?? timestampMs(row.created_at_ms, row.created_at)
+    ?? 0;
 }
 
 function readProjectlessThreadIds(home: string): Set<string> {
